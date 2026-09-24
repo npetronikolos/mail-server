@@ -1,0 +1,28 @@
+# Managed by mail-server install.sh
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1 {{FAIL2BAN_IGNORE}}
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+backend  = systemd
+banaction = {{FAIL2BAN_BANACTION}}
+
+[sshd]
+enabled = true
+port    = {{SSH_PORT}}
+
+[postfix]
+enabled = true
+mode    = aggressive
+
+[postfix-sasl]
+enabled = true
+
+[dovecot]
+enabled = true
+
+[roundcube-auth]
+enabled = {{WEBMAIL_JAIL}}
+backend = auto
+logpath = /var/log/roundcube/errors.log
+port    = http,https
