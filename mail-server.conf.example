@@ -1,0 +1,72 @@
+# -----------------------------------------------------------------------------
+# Mail server configuration
+#
+# Copy this file to "mail-server.conf" (next to install.sh), fill it in,
+# then run:  sudo ./install.sh
+#
+# After installation a copy lives at /etc/mail-server/mail-server.conf and is
+# used by the "mailctl" management command.
+# -----------------------------------------------------------------------------
+
+# Your main email domain (the part after the @).
+DOMAIN="example.com"
+
+# The server's own name. Must have an A record pointing at this server and a
+# matching reverse DNS (PTR) record set at your hosting provider.
+MAIL_HOSTNAME="mail.example.com"
+
+# The server's public IPv4 address.
+SERVER_IPV4="203.0.113.10"
+
+# The server's public IPv6 address. Leave empty to send and receive mail over
+# IPv4 only (recommended unless you have also set an IPv6 PTR record).
+SERVER_IPV6=""
+
+# First mailbox to create. Also receives mail for postmaster@, abuse@
+# (including DMARC reports) and root's system mail. Must be an address at DOMAIN.
+ADMIN_EMAIL="admin@example.com"
+
+# Password for ADMIN_EMAIL. Leave empty to be asked during installation
+# (or to have one generated when running without a terminal).
+ADMIN_PASSWORD=""
+
+# Email address Let's Encrypt uses for expiry warnings. Use an address that
+# is NOT hosted on this server (e.g. a Gmail address), so you still get the
+# warning if this server is down.
+LETSENCRYPT_EMAIL="you@gmail.com"
+
+# TLS certificates:
+#   letsencrypt - free trusted certificate, renewed automatically (normal use)
+#   selfsigned  - for lab/testing only; mail clients will show warnings
+CERT_MODE="letsencrypt"
+
+# Also get certificates for autoconfig.DOMAIN (automatic setup for
+# Thunderbird and others). Only set to "yes" after creating the DNS record
+# "autoconfig.DOMAIN CNAME MAIL_HOSTNAME", otherwise the certificate fails.
+ENABLE_AUTOCONFIG_SUBDOMAIN="no"
+
+# Virus scanning with ClamAV. Needs about 1.5 GB of extra RAM; turn off on
+# servers with less than 3 GB of memory.
+ENABLE_CLAMAV="yes"
+
+# Roundcube webmail at https://MAIL_HOSTNAME/
+ENABLE_WEBMAIL="yes"
+
+# Configure the UFW firewall (opens SSH + mail + web ports, blocks the rest).
+ENABLE_FIREWALL="yes"
+
+# Your SSH port, so the firewall does not lock you out.
+SSH_PORT="22"
+
+# DKIM selector name (appears in DNS as <selector>._domainkey.DOMAIN).
+DKIM_SELECTOR="mail"
+
+# Largest email (including attachments) that can be sent or received, in MB.
+MESSAGE_SIZE_LIMIT_MB="50"
+
+# Server time zone (e.g. "Europe/Athens", "America/New_York").
+TIMEZONE="UTC"
+
+# Nightly backups.
+BACKUP_DIR="/var/backups/mail-server"
+BACKUP_KEEP_DAYS="14"

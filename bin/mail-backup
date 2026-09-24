@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# mail-backup - archive all mail, configuration, keys and webmail data.
+# Runs nightly from /etc/cron.d/mail-server; can also be run by hand.
+set -euo pipefail
+
+CONF=/etc/mail-server/mail-server.conf
+# shellcheck source=/dev/null
+source "$CONF"
+BACKUP_DIR=${BACKUP_DIR:-/var/backups/mail-server}
+BACKUP_KEEP_DAYS=${BACKUP_KEEP_DAYS:-14}
+
+[[ $EUID -eq 0 ]] || { echo "mail-backup: must be run as root" >&2; exit 1; }
+
+install -d -m 700 "$BACKUP_DIR"
+stamp=$(date +%Y-%m-%d_%H%M%S)
+out="$BACKUP_DIR/mail-backup-$stamp.tar.gz"
+
+paths=(
+  /etc/mail-server
+  /etc/postfix
+  /etc/dovecot
+  /etc/rspamd/local.d
+  /etc/rspamd/override.d
+  /var/lib/rspamd/dkim
+  /etc/letsencrypt
+  /etc/roundcube
+  /var/lib/dbconfig-common/sqlite3/roundcube
+  /var/vmail
+)
+existing=()
+for p in "${paths[@]}"; do
+  [[ -e $p ]] && existing+=("${p#/}")
+done
+
+# Mail keeps arriving during the backup; tar may report files that changed
+# or vanished while reading (exit code 1). That is harmless for Maildir.
+umask 077
+rc=0
+tar --create --gzip --file "$out" --directory / \
+    --warning=no-file-changed --warning=no-file-removed \
+    "${existing[@]}" || rc=$?
+if [[ $rc -gt 1 ]]; then
+  echo "mail-backup: tar failed (exit $rc)" >&2
+  rm -f "$out"
+  exit "$rc"
+fi
+
+find "$BACKUP_DIR" -maxdepth 1 -name 'mail-backup-*.tar.gz' -mtime +"$BACKUP_KEEP_DAYS" -delete
+
+echo "backup written: $out ($(du -h "$out" | cut -f1))"

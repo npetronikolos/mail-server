@@ -1,0 +1,20 @@
+#!/bin/sh
+# mail-server-fix-roundcube - keep Roundcube working on PHP 8.5+.
+#
+# PHP 8.5 added a built-in array_first(); Roundcube 1.6.11 and older define
+# their own, which makes every page fail with "Cannot redeclare function
+# array_first()". This wraps Roundcube's copy in a function_exists() check.
+# Both versions return the first element of an array, so behaviour is the same.
+#
+# Safe to run any number of times; does nothing when no fix is needed.
+# Runs after every apt/dpkg operation (/etc/apt/apt.conf.d/99mail-server).
+set -eu
+
+f=/usr/share/roundcube/program/lib/Roundcube/bootstrap.php
+[ -f "$f" ] || exit 0
+grep -q '^function array_first(' "$f" || exit 0
+grep -q 'function_exists("array_first")' "$f" && exit 0
+php -r 'exit(function_exists("array_first") ? 0 : 1);' 2>/dev/null || exit 0
+
+perl -0pi -e 's/^function array_first\(\$array\)\n\{\n(.*?)\n\}\n/if (!function_exists("array_first")) {\nfunction array_first(\$array)\n{\n$1\n}\n}\n/sm' "$f"
+echo "mail-server: patched Roundcube for PHP 8.5 (array_first)"
