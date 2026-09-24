@@ -10,7 +10,10 @@
 #   ClamAV    - virus scanning (optional)
 #   Unbound   - local DNS resolver so DNS blocklists work
 #   Roundcube - webmail at https://MAIL_HOSTNAME/ (nginx + PHP-FPM)
+#   Radicale  - calendars and contacts (CalDAV/CardDAV) at /dav/
+#   Dashboard - web admin panel at https://MAIL_HOSTNAME/admin/ (with 2FA)
 #   Certbot   - Let's Encrypt certificates, renewed automatically
+#   MTA-STS, TLS-RPT, outbound MTA-STS checks, postscreen, mailbox quotas
 #   Fail2ban, UFW firewall, unattended security upgrades, nightly backups
 #
 # Usage:
@@ -115,7 +118,13 @@ preflight() {
   ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
   LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-$ADMIN_EMAIL}
   CERT_MODE=${CERT_MODE:-letsencrypt}
-  ENABLE_AUTOCONFIG_SUBDOMAIN=${ENABLE_AUTOCONFIG_SUBDOMAIN:-no}
+  ENABLE_DASHBOARD=${ENABLE_DASHBOARD:-yes}
+  ENABLE_DAV=${ENABLE_DAV:-yes}
+  ENABLE_MTA_STS=${ENABLE_MTA_STS:-yes}
+  MTA_STS_MODE=${MTA_STS_MODE:-enforce}
+  ADMIN_ALLOWED_IPS=${ADMIN_ALLOWED_IPS:-}
+  DEFAULT_QUOTA=${DEFAULT_QUOTA:-}
+  BACKUP_RSYNC_TARGET=${BACKUP_RSYNC_TARGET:-}
   ENABLE_CLAMAV=${ENABLE_CLAMAV:-yes}
   ENABLE_WEBMAIL=${ENABLE_WEBMAIL:-yes}
   ENABLE_FIREWALL=${ENABLE_FIREWALL:-yes}
@@ -133,6 +142,9 @@ preflight() {
   [[ $CERT_MODE == letsencrypt || $CERT_MODE == selfsigned ]] || die "CERT_MODE must be letsencrypt or selfsigned"
   [[ $MESSAGE_SIZE_LIMIT_MB =~ ^[0-9]+$ ]] || die "MESSAGE_SIZE_LIMIT_MB must be a number"
   [[ $SSH_PORT =~ ^[0-9]+$ ]] || die "SSH_PORT must be a number"
+  [[ $MTA_STS_MODE =~ ^(enforce|testing|none)$ ]] || die "MTA_STS_MODE must be enforce, testing or none"
+  [[ -z $DEFAULT_QUOTA || $DEFAULT_QUOTA =~ ^[0-9]+[KMGTkmgt]?$ ]] || die "DEFAULT_QUOTA must look like 5G or 500M"
+  [[ $ENABLE_DAV == yes && $ENABLE_DASHBOARD != yes ]] && die "ENABLE_DAV needs ENABLE_DASHBOARD=yes (it checks the passwords)"
 
   # shellcheck source=/dev/null
   source /etc/os-release
@@ -176,16 +188,12 @@ preflight() {
   NGINX_LISTEN_V6_HTTP="    # (IPv6 disabled on this machine)"
   NGINX_LISTEN_V6_HTTPS=$NGINX_LISTEN_V6_HTTP
   if [[ -s /proc/net/if_inet6 ]]; then
-    NGINX_LISTEN_V6_HTTP="    listen [::]:80;"
+    NGINX_LISTEN_V6_HTTP="    listen [::]:80 default_server;"
     NGINX_LISTEN_V6_HTTPS="    listen [::]:443 ssl;"
   fi
   MESSAGE_SIZE_LIMIT_BYTES=$((MESSAGE_SIZE_LIMIT_MB * 1024 * 1024))
   # Attachments grow by about a third when encoded for email.
   WEB_UPLOAD_LIMIT_MB=$((MESSAGE_SIZE_LIMIT_MB * 4 / 3 + 1))
-  WEB_SERVER_NAMES=$MAIL_HOSTNAME
-  if [[ $ENABLE_AUTOCONFIG_SUBDOMAIN == yes ]]; then
-    WEB_SERVER_NAMES="$MAIL_HOSTNAME autoconfig.$DOMAIN"
-  fi
 }
 
 # ---------------------------------------------------------------- steps
@@ -193,7 +201,9 @@ preflight() {
 setup_system() {
   step "Basic system settings"
   install -d -m 755 "$ETC"
-  install -m 640 "$CONF_SRC" "$ETC/mail-server.conf"
+  # Keep a copy for mailctl and the dashboard, minus the admin password.
+  sed 's/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=""/' "$CONF_SRC" >"$ETC/mail-server.conf"
+  chmod 640 "$ETC/mail-server.conf"
   touch "$SECRETS"
   chmod 600 "$SECRETS"
 
@@ -233,8 +243,8 @@ EOF
     own_policy=yes
   fi
 
-  apt_install ca-certificates curl openssl cron \
-    postfix postfix-pcre \
+  apt_install ca-certificates curl openssl cron python3 bind9-dnsutils rsync \
+    postfix postfix-pcre postfix-mta-sts-resolver \
     dovecot-core dovecot-imapd dovecot-lmtpd dovecot-sieve dovecot-managesieved \
     rspamd redis-server unbound dns-root-data \
     nginx certbot \
@@ -246,6 +256,12 @@ EOF
   fi
   if [[ $ENABLE_FIREWALL == yes ]]; then
     apt_install ufw
+  fi
+  if [[ $ENABLE_DASHBOARD == yes ]]; then
+    apt_install sudo python3-flask python3-pyotp python3-qrcode gunicorn
+  fi
+  if [[ $ENABLE_DAV == yes ]]; then
+    apt_install radicale
   fi
   if [[ $ENABLE_WEBMAIL == yes ]]; then
     # nginx must already be installed so Roundcube does not pull in Apache.
@@ -293,7 +309,6 @@ setup_certificates() {
     if [[ ! -f $TLS_CERT ]]; then
       install -d -m 700 "$ETC/tls"
       local san="DNS:$MAIL_HOSTNAME"
-      [[ $ENABLE_AUTOCONFIG_SUBDOMAIN == yes ]] && san+=",DNS:autoconfig.$DOMAIN"
       openssl req -x509 -newkey rsa:3072 -nodes -days 3650 -sha256 \
         -keyout "$TLS_KEY" -out "$TLS_CERT" -subj "/CN=$MAIL_HOSTNAME" \
         -addext "subjectAltName=$san" 2>/dev/null
@@ -304,13 +319,12 @@ setup_certificates() {
 
   TLS_CERT=/etc/letsencrypt/live/$MAIL_HOSTNAME/fullchain.pem
   TLS_KEY=/etc/letsencrypt/live/$MAIL_HOSTNAME/privkey.pem
-  local domains=(-d "$MAIL_HOSTNAME")
-  [[ $ENABLE_AUTOCONFIG_SUBDOMAIN == yes ]] && domains+=(-d "autoconfig.$DOMAIN")
-
+  # Only the mail host here; "mailctl cert" (run at the end, and daily) adds
+  # mta-sts/autoconfig/autodiscover names once their DNS points here.
   certbot certonly --webroot -w /var/www/letsencrypt \
-    --cert-name "$MAIL_HOSTNAME" "${domains[@]}" \
+    --cert-name "$MAIL_HOSTNAME" -d "$MAIL_HOSTNAME" \
     --email "$LETSENCRYPT_EMAIL" --agree-tos --no-eff-email \
-    --non-interactive --keep-until-expiring --expand \
+    --non-interactive --keep-until-expiring \
     || die "could not get a Let's Encrypt certificate. Check that $MAIL_HOSTNAME points to
   this server and that port 80 is reachable from the internet."
 
@@ -382,7 +396,12 @@ setup_postfix() {
     "smtpd_helo_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_invalid_helo_hostname, reject_non_fqdn_helo_hostname" \
     "smtpd_sender_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_non_fqdn_sender, reject_unknown_sender_domain" \
     "smtpd_relay_restrictions = permit_mynetworks, permit_sasl_authenticated, defer_unauth_destination" \
-    "smtpd_recipient_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_non_fqdn_recipient, reject_unknown_recipient_domain, reject_unlisted_recipient" \
+    "smtpd_recipient_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_non_fqdn_recipient, reject_unknown_recipient_domain, reject_unlisted_recipient, check_policy_service inet:127.0.0.1:12340" \
+    \
+    "smtp_tls_policy_maps = socketmap:inet:127.0.0.1:8461:postfix" \
+    \
+    "postscreen_access_list = permit_mynetworks" \
+    "postscreen_greet_action = enforce" \
     \
     "smtpd_milters = inet:127.0.0.1:11332" \
     'non_smtpd_milters = $smtpd_milters' \
@@ -407,6 +426,18 @@ setup_postfix() {
   done
   postconf -P "submission/inet/smtpd_tls_security_level=encrypt"
   postconf -P "submissions/inet/smtpd_tls_wrappermode=yes"
+
+  # postscreen screens port 25 before the real SMTP server: bots that talk
+  # before the greeting are dropped without costing an smtpd process.
+  postconf -M \
+    "smtp/inet=smtp inet n - y - 1 postscreen" \
+    "smtpd/pass=smtpd pass - - y - - smtpd" \
+    "dnsblog/unix=dnsblog unix - - y - 0 dnsblog" \
+    "tlsproxy/unix=tlsproxy unix - - y - 0 tlsproxy"
+
+  # Outgoing mail: honour the MTA-STS policies of receiving domains
+  # (like Gmail and Outlook), so their mail is only sent encrypted.
+  systemctl enable postfix-mta-sts-resolver >/dev/null 2>&1 || true
 
   newaliases
   postfix check
@@ -471,12 +502,103 @@ setup_rspamd() {
   systemctl restart rspamd
 }
 
-setup_webmail() {
+# render_var <template>: print a rendered template (for embedding in another one).
+render_var() {
+  local tmp
+  tmp=$(mktemp)
+  render "$1" "$tmp"
+  cat "$tmp"
+  rm -f "$tmp"
+}
+
+setup_autoconfig() {
   install -d -m 755 /var/www/mail-autoconfig
   render "$TEMPLATES/autoconfig.xml" /var/www/mail-autoconfig/config-v1.1.xml
+  AUTODISCOVER_XML=$(render_var "$TEMPLATES/autodiscover.xml")
+
+  # MTA-STS policy. Rewritten only when it changes, because its date is the
+  # policy id published in DNS (see "mailctl dns").
+  local mode=$MTA_STS_MODE policy
+  [[ $CERT_MODE == selfsigned && $mode == enforce ]] && mode=testing
+  [[ $ENABLE_MTA_STS == yes ]] || mode=none
+  policy=$(printf 'version: STSv1\nmode: %s\nmx: %s\nmax_age: 604800\n' "$mode" "$MAIL_HOSTNAME")
+  if [[ ! -f /var/www/mail-autoconfig/mta-sts.txt || $(</var/www/mail-autoconfig/mta-sts.txt) != "$policy" ]]; then
+    printf '%s\n' "$policy" >/var/www/mail-autoconfig/mta-sts.txt
+  fi
+  AUTOCONFIG_LOCATIONS=$(render_var "$TEMPLATES/nginx/autoconfig-locations.conf")
+}
+
+setup_dashboard() {
+  DASHBOARD_LOCATIONS=""
+  DASHBOARD_JAIL=false
+  [[ $ENABLE_DASHBOARD == yes ]] || return 0
+  step "Admin dashboard"
+  DASHBOARD_JAIL=true
+
+  if ! id mail-dashboard >/dev/null 2>&1; then
+    useradd --system --user-group --home-dir /var/lib/mail-dashboard --no-create-home \
+      --shell /usr/sbin/nologin --comment "Mail admin dashboard" mail-dashboard
+  fi
+  rm -rf /opt/mail-dashboard
+  install -d -m 755 /opt/mail-dashboard
+  cp -r "$SCRIPT_DIR/dashboard/." /opt/mail-dashboard/
+  chmod -R u=rwX,go=rX /opt/mail-dashboard
+  install -d -o mail-dashboard -g mail-dashboard -m 700 /var/lib/mail-dashboard
+  install -d -o mail-dashboard -g adm -m 750 /var/log/mail-dashboard
+  [[ -f /var/log/mail-dashboard/auth.log ]] || install -o mail-dashboard -g adm -m 640 /dev/null /var/log/mail-dashboard/auth.log
+
+  # Settings and the admin list are readable (not writable) by the dashboard.
+  chgrp mail-dashboard "$ETC/mail-server.conf"
+  [[ -f $ETC/admins ]] || install -m 640 /dev/null "$ETC/admins"
+  chown root:mail-dashboard "$ETC/admins"
+  chmod 640 "$ETC/admins"
+
+  # The dashboard may run mailctl as root, and nothing else.
+  cat >/etc/sudoers.d/mail-dashboard <<'EOF'
+# Installed by mail-server install.sh
+mail-dashboard ALL=(root) NOPASSWD: /usr/local/sbin/mailctl
+EOF
+  chmod 440 /etc/sudoers.d/mail-dashboard
+  visudo -c -q -f /etc/sudoers.d/mail-dashboard || die "invalid sudoers file for the dashboard"
+
+  GUNICORN=$(command -v gunicorn || command -v gunicorn3)
+  render "$TEMPLATES/systemd/mail-dashboard.service" /etc/systemd/system/mail-dashboard.service
+  install -m 644 "$TEMPLATES/fail2ban/mail-dashboard-filter.conf" /etc/fail2ban/filter.d/mail-dashboard.conf
+  systemctl daemon-reload
+  systemctl enable mail-dashboard >/dev/null
+  systemctl restart mail-dashboard
+
+  ADMIN_ALLOW=""
+  if [[ -n $ADMIN_ALLOWED_IPS ]]; then
+    local ip
+    for ip in $ADMIN_ALLOWED_IPS; do ADMIN_ALLOW+="        allow $ip;"$'\n'; done
+    ADMIN_ALLOW+="        deny all;"
+  fi
+  DASHBOARD_LOCATIONS=$(render_var "$TEMPLATES/nginx/dashboard-locations.conf")
+}
+
+setup_dav() {
+  DAV_LOCATIONS=""
+  [[ $ENABLE_DAV == yes ]] || return 0
+  step "Calendar and contacts (Radicale)"
+  install -d -m 755 /etc/radicale
+  install -m 644 "$TEMPLATES/radicale/config" /etc/radicale/config
+  install -d -o radicale -g radicale -m 750 /var/lib/radicale/collections
+  systemctl enable radicale >/dev/null
+  systemctl restart radicale
+  DAV_LOCATIONS=$(render_var "$TEMPLATES/nginx/dav-locations.conf")
+}
+
+setup_webmail() {
 
   if [[ $ENABLE_WEBMAIL != yes ]]; then
     WEBMAIL_LOCATIONS=$(<"$TEMPLATES/nginx/no-webmail-locations.conf")
+    if [[ $ENABLE_DASHBOARD == yes ]]; then
+      WEBMAIL_LOCATIONS='    location = / {
+        return 302 /admin/;
+    }
+'"$WEBMAIL_LOCATIONS"
+    fi
   else
     step "Roundcube webmail"
     local php_ver
@@ -501,20 +623,14 @@ EOF
     install -d -o www-data -g adm -m 750 /var/log/roundcube
     [[ -f /var/log/roundcube/errors.log ]] || install -o www-data -g adm -m 640 /dev/null /var/log/roundcube/errors.log
 
-    local tmp
-    tmp=$(mktemp)
-    render "$TEMPLATES/nginx/webmail-locations.conf" "$tmp"
-    WEBMAIL_LOCATIONS=$(<"$tmp")
-    rm -f "$tmp"
+    WEBMAIL_LOCATIONS=$(render_var "$TEMPLATES/nginx/webmail-locations.conf")
     systemctl reload "php$php_ver-fpm"
   fi
+}
 
+setup_nginx_https() {
   step "nginx (HTTPS)"
-  local tmp
-  tmp=$(mktemp)
-  render "$TEMPLATES/nginx/mail-https.conf" "$tmp"
-  cat "$tmp" >>/etc/nginx/sites-available/mail-server
-  rm -f "$tmp"
+  render_var "$TEMPLATES/nginx/mail-https.conf" >>/etc/nginx/sites-available/mail-server
   nginx -t -q
   systemctl reload nginx
 }
@@ -561,6 +677,11 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Nightly backup of mail, configuration and keys
 30 3 * * * root /usr/local/sbin/mail-backup >/dev/null
 EOF
+  if [[ $CERT_MODE == letsencrypt ]]; then
+    # Add mta-sts/autoconfig/autodiscover names to the certificate once their
+    # DNS points here (does nothing when nothing changed).
+    echo "17 4 * * * root /usr/local/sbin/mailctl cert >/dev/null 2>&1" >>/etc/cron.d/mail-server
+  fi
   if [[ $ENABLE_CLAMAV == yes ]]; then
     # clamd only starts once freshclam has downloaded the virus database
     # (a few minutes after install); this starts it then, and after a crash.
@@ -572,6 +693,7 @@ EOF
 
 start_services() {
   step "Starting services"
+  systemctl restart postfix-mta-sts-resolver || true
   systemctl restart rspamd
   systemctl restart dovecot
   systemctl restart postfix
@@ -584,6 +706,7 @@ start_services() {
 
 setup_accounts() {
   step "Domain and administrator mailbox"
+  mailctl migrate >/dev/null
   if ! has_key /etc/postfix/vdomains "$DOMAIN"; then
     mailctl domain add "$DOMAIN" >/dev/null
   fi
@@ -599,6 +722,17 @@ setup_accounts() {
       GENERATED_ADMIN_PASSWORD=$(random_string 20)
       printf '%s\n' "$GENERATED_ADMIN_PASSWORD" | mailctl user add "$ADMIN_EMAIL"
     fi
+  fi
+
+  # The first admin of the dashboard.
+  if [[ ! -s $ETC/admins ]] || ! grep -qv '^#' "$ETC/admins"; then
+    mailctl admin add "$ADMIN_EMAIL" >/dev/null
+  fi
+
+  # Extend the certificate with mta-sts/autoconfig/autodiscover names that
+  # already point here (more are added daily by cron as DNS appears).
+  if [[ $CERT_MODE == letsencrypt ]]; then
+    mailctl cert >/dev/null 2>&1 || warn "could not extend the certificate; run 'mailctl cert' later"
   fi
 
   # System mail for root goes to the administrator.
@@ -618,6 +752,8 @@ Mailbox:     $ADMIN_EMAIL
 EOF
   [[ -n $GENERATED_ADMIN_PASSWORD ]] && echo "Password:    $GENERATED_ADMIN_PASSWORD   (change it: mailctl user passwd $ADMIN_EMAIL)"
   [[ $ENABLE_WEBMAIL == yes ]] && echo "Webmail:     https://$MAIL_HOSTNAME/"
+  [[ $ENABLE_DASHBOARD == yes ]] && echo "Admin:       https://$MAIL_HOSTNAME/admin/   (sign in as $ADMIN_EMAIL)"
+  [[ $ENABLE_DAV == yes ]] && echo "Calendars:   https://$MAIL_HOSTNAME/dav/"
   cat <<EOF
 
 Mail app settings (Outlook, Thunderbird, iPhone, Android):
@@ -635,7 +771,8 @@ Next steps:
   1. Create the DNS records above (see DNS.md for help).
   2. Check PTR:    dig -x $SERVER_IPV4 +short    -> should print $MAIL_HOSTNAME.
   3. Send a test mail to the address shown on https://www.mail-tester.com
-  4. Manage mail:  sudo mailctl help
+  4. Health check: sudo mailctl check   (or the Health page in the dashboard)
+  5. Manage mail:  the dashboard, or sudo mailctl help
 
 Installation log: $LOG
 EOF
@@ -654,8 +791,12 @@ main() {
   setup_postfix
   setup_dovecot
   setup_rspamd
-  setup_webmail
   setup_tools
+  setup_autoconfig
+  setup_dashboard
+  setup_dav
+  setup_webmail
+  setup_nginx_https
   start_services
   setup_accounts
   setup_security

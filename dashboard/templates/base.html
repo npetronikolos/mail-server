@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Mail admin{% endblock %} · {{ conf.MAIL_HOSTNAME }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <link rel="icon" href="{{ url_for('static', filename='icon.svg') }}" type="image/svg+xml">
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body>
+{% if me %}
+<div class="shell">
+  <nav class="side" id="side">
+    <a class="brand" href="{{ url_for('index') }}">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4h13A2.5 2.5 0 0 1 21 6.5v11a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m4 7 8 6 8-6" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+      <span><strong>Mail</strong><small>{{ conf.MAIL_HOSTNAME }}</small></span>
+    </a>
+    {% set ep = request.endpoint %}
+    {% if is_admin %}
+    <div class="navgroup">Server</div>
+    <a href="{{ url_for('index') }}" class="{{ 'on' if ep == 'index' }}">Overview</a>
+    <a href="{{ url_for('health') }}" class="{{ 'on' if ep == 'health' }}">Health checks</a>
+    <div class="navgroup">Mail</div>
+    <a href="{{ url_for('domains') }}" class="{{ 'on' if ep in ('domains', 'domain_view') }}">Domains &amp; DNS</a>
+    <a href="{{ url_for('mailboxes') }}" class="{{ 'on' if ep == 'mailboxes' }}">Mailboxes</a>
+    <a href="{{ url_for('aliases') }}" class="{{ 'on' if ep == 'aliases' }}">Aliases</a>
+    <a href="{{ url_for('queue') }}" class="{{ 'on' if ep == 'queue' }}">Mail queue</a>
+    <div class="navgroup">Operations</div>
+    <a href="{{ url_for('security') }}" class="{{ 'on' if ep == 'security' }}">Security</a>
+    <a href="{{ url_for('logs') }}" class="{{ 'on' if ep == 'logs' }}">Logs</a>
+    <a href="{{ url_for('backups') }}" class="{{ 'on' if ep == 'backups' }}">Backups</a>
+    {% endif %}
+    <div class="navgroup">You</div>
+    <a href="{{ url_for('account') }}" class="{{ 'on' if ep in ('account', 'account_2fa') }}">My account</a>
+    {% if conf.ENABLE_WEBMAIL == 'yes' %}<a href="/" target="_blank" rel="noopener">Webmail ↗</a>{% endif %}
+    <form method="post" action="{{ url_for('logout') }}" class="signout">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <span class="who">{{ me }}</span>
+      <button class="link">Sign out</button>
+    </form>
+  </nav>
+  <main class="main">
+    <button class="menu" data-toggle="side" aria-label="Menu">☰</button>
+    {% with msgs = get_flashed_messages(with_categories=true) %}
+      {% for cat, msg in msgs %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
+    {% endwith %}
+    {% block main %}{% endblock %}
+  </main>
+</div>
+{% else %}
+<main class="solo">
+  {% with msgs = get_flashed_messages(with_categories=true) %}
+    {% for cat, msg in msgs %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
+  {% endwith %}
+  {% block solo %}{% endblock %}
+</main>
+{% endif %}
+</body>
+</html>

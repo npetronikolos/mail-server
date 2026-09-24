@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Error{% endblock %}
+{% macro body() %}
+<div class="card">
+  <h1>{% if code == 403 %}Not allowed{% elif code == 404 %}Not found{% else %}Something went wrong{% endif %}</h1>
+  <p>{{ message }}</p>
+  <p><a class="btn" href="{{ url_for('index') }}">Back</a></p>
+</div>
+{% endmacro %}
+{% block main %}{{ body() }}{% endblock %}
+{% block solo %}{{ body() }}{% endblock %}

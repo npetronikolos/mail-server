@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Mail queue{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>Mail queue</h1><p class="muted">Outgoing mail that could not be delivered yet. Postfix retries automatically for 5 days.</p></div>
+  <form method="post" action="{{ url_for('queue_action') }}" class="inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="action" value="flush">
+    <button class="btn" {{ 'disabled' if not items }}>Retry all now</button>
+  </form>
+</header>
+<section class="card">
+  {% if items %}
+  <table>
+    <thead><tr><th>Queued</th><th>From</th><th>To / reason</th><th>Size</th><th></th></tr></thead>
+    <tbody>
+    {% for q in items %}
+      <tr>
+        <td class="nowrap">{{ ago(q.arrival) }}<br><small class="muted">{{ q.id }} · {{ q.queue }}</small></td>
+        <td class="clip">{{ q.sender or '<>' }}</td>
+        <td>{% for r in q.recipients %}<div>{{ r.address }}<br><small class="muted">{{ r.reason }}</small></div>{% endfor %}</td>
+        <td class="nowrap">{{ human(q.size) }}</td>
+        <td class="actions">
+          <form method="post" action="{{ url_for('queue_action') }}" class="inline">
+            <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ q.id }}">
+            {% if q.queue == 'hold' %}<button class="btn small" name="action" value="release">Release</button>
+            {% else %}<button class="btn small" name="action" value="hold">Hold</button>{% endif %}
+          </form>
+          <form method="post" action="{{ url_for('queue_action') }}" class="inline" data-confirm="Delete this message? The sender is not notified.">
+            <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ q.id }}">
+            <button class="btn small danger" name="action" value="delete">Delete</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">The queue is empty. All mail has been delivered.</p>
+  {% endif %}
+</section>
+{% endblock %}

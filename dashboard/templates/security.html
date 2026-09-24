@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Security{% endblock %}
+{% block main %}
+<header class="head"><div><h1>Security</h1><p class="muted">Blocked attackers, sign-ins and every admin change.</p></div></header>
+<section class="card">
+  <h2>Blocked IP addresses (fail2ban)</h2>
+  <table>
+    <thead><tr><th>Protects</th><th>Failed attempts</th><th>Blocked now</th></tr></thead>
+    <tbody>
+    {% for b in bans %}
+      <tr>
+        <td><strong>{{ b.jail }}</strong></td>
+        <td>{{ b.total_failed }}</td>
+        <td>
+          {% for ip in b.banned %}
+          <form method="post" action="{{ url_for('unban') }}" class="inline chip">
+            <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="ip" value="{{ ip }}">
+            <code>{{ ip }}</code><button class="link" title="Unblock">✕</button>
+          </form>
+          {% else %}<span class="muted">none</span>{% endfor %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+<div class="grid two">
+  <section class="card">
+    <h2>Dashboard sign-ins</h2>
+    <pre class="log short">{% for l in auth %}{{ l }}{% else %}No sign-ins yet.{% endfor %}</pre>
+  </section>
+  <section class="card">
+    <h2>Admin changes</h2>
+    <pre class="log short">{% for l in audit %}{{ l }}
+{% else %}No changes yet.{% endfor %}</pre>
+  </section>
+</div>
+{% endblock %}

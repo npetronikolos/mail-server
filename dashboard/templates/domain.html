@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}{{ domain }}{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>{{ domain }}</h1><p class="muted">Create these records at your DNS provider. The status column checks the live DNS.</p></div>
+  <a class="btn" href="{{ url_for('domains') }}">All domains</a>
+</header>
+<section class="card">
+  <table class="dns" id="dns" data-src="{{ url_for('api_dns', domain=domain) }}">
+    <thead><tr><th>Status</th><th>Type</th><th>Name</th><th>Value</th><th>Purpose</th></tr></thead>
+    <tbody>
+    {% for r in records %}
+      <tr data-key="{{ r.type }} {{ r.name }}">
+        <td class="st"><span class="badge">checking…</span></td>
+        <td><strong>{{ r.type }}</strong>{% if not r.required %}<br><small class="muted">optional</small>{% endif %}</td>
+        <td><code>{{ r.name }}</code></td>
+        <td class="val"><code class="copy" title="Click to copy">{{ r.value }}</code></td>
+        <td class="muted small">{{ r.purpose }}<div class="note"></div></td>
+      </tr>
+    {% endfor %}
+      <tr data-key="PTR {{ conf.SERVER_IPV4 }}" {{ 'hidden' if domain != conf.DOMAIN }}>
+        <td class="st"><span class="badge">checking…</span></td>
+        <td><strong>PTR</strong></td><td><code>{{ conf.SERVER_IPV4 }}</code></td>
+        <td class="val"><code class="copy">{{ conf.MAIL_HOSTNAME }}</code></td>
+        <td class="muted small">Reverse DNS - set at your hosting provider, not your DNS provider<div class="note"></div></td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted small">"@" means the domain itself. Click a value to copy it. Long DKIM values: most DNS providers split them automatically.</p>
+</section>
+{% endblock %}
