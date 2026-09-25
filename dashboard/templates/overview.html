@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}Overview{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>Overview</h1><p class="muted">{{ st.hostname }} · {{ st.server_ipv4 }} · up {{ (st.uptime_seconds // 86400) }} days</p></div>
+  <a class="btn" href="{{ url_for('health') }}">Run health check</a>
+</header>
+
+{% if not has_totp %}
+<div class="flash warn">Protect the admin dashboard: <a href="{{ url_for('account_2fa') }}">turn on two-factor sign-in</a>.</div>
+{% endif %}
+{% if st.reboot_required %}<div class="flash warn">Security updates were installed that need a reboot.</div>{% endif %}
+
+<section class="stats">
+  <a class="stat" href="{{ url_for('domains') }}"><span>Domains</span><strong>{{ st.counts.domains }}</strong></a>
+  <a class="stat" href="{{ url_for('mailboxes') }}"><span>Mailboxes</span><strong>{{ st.counts.mailboxes }}</strong></a>
+  <a class="stat" href="{{ url_for('aliases') }}"><span>Aliases</span><strong>{{ st.counts.aliases }}</strong></a>
+  <a class="stat {{ 'alert' if st.counts.queue > 20 }}" href="{{ url_for('queue') }}"><span>In queue</span><strong>{{ st.counts.queue }}</strong></a>
+  <div class="stat"><span>Mail stored</span><strong>{{ human(st.disk.vmail) }}</strong></div>
+</section>
+
+<div class="grid two">
+  <section class="card">
+    <h2>Services</h2>
+    <ul class="services">
+    {% for name, state in st.services.items() %}
+      <li><span class="dot {{ 'ok' if state == 'active' else ('warn' if name == 'clamav-daemon' else 'error') }}"></span>{{ name }}<em>{{ state }}</em></li>
+    {% endfor %}
+    </ul>
+  </section>
+
+  <section class="card">
+    <h2>Server</h2>
+    {% set disk_used = st.disk.total - st.disk.free %}
+    <p class="meterrow"><span>Disk</span><meter min="0" max="{{ st.disk.total }}" low="{{ st.disk.total * 0.8 }}" high="{{ st.disk.total * 0.9 }}" optimum="0" value="{{ disk_used }}"></meter><em>{{ human(st.disk.free) }} free</em></p>
+    {% set mem_used = st.memory.total - st.memory.available %}
+    <p class="meterrow"><span>Memory</span><meter min="0" max="{{ st.memory.total }}" low="{{ st.memory.total * 0.8 }}" high="{{ st.memory.total * 0.9 }}" optimum="0" value="{{ mem_used }}"></meter><em>{{ human(st.memory.available) }} free</em></p>
+    <p class="meterrow"><span>Load</span><meter min="0" max="{{ st.cpus or 1 }}" low="{{ (st.cpus or 1) * 0.7 }}" high="{{ st.cpus or 1 }}" optimum="0" value="{{ st.load[0] }}"></meter><em>{{ '%.2f' % st.load[0] }} / {{ st.cpus }} CPU</em></p>
+    {% if st.certificate %}
+    <p class="meterrow"><span>Certificate</span><span class="badge {{ 'ok' if st.certificate.days_left > 14 else 'warn' }}">{{ st.certificate.days_left }} days left</span><em>{{ st.certificate.issuer }}</em></p>
+    {% endif %}
+    <form method="post" action="{{ url_for('cert_refresh') }}" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn small" title="Adds mta-sts / autoconfig / autodiscover names that point here">Refresh certificate names</button>
+    </form>
+  </section>
+</div>
+
+<div class="grid two">
+  <section class="card">
+    <h2>Spam filter</h2>
+    {% if stats %}
+    <p class="muted">{{ stats.scanned or 0 }} messages scanned · {{ stats.learned or 0 }} learned</p>
+    {% set labels = {'no action': 'Delivered', 'add header': 'Junk folder', 'rewrite subject': 'Subject tagged', 'greylist': 'Greylisted', 'soft reject': 'Delayed', 'reject': 'Rejected'} %}
+    {% for key, label in labels.items() %}
+      {% set n = actions.get(key, 0) %}
+      <p class="meterrow"><span>{{ label }}</span><meter class="{{ key|replace(' ', '-') }}" min="0" max="{{ total or 1 }}" value="{{ n }}"></meter><em>{{ n }}</em></p>
+    {% endfor %}
+    {% else %}
+    <p class="muted">Rspamd statistics are not available.</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Recent messages</h2>
+    {% if history %}
+    <table class="compact">
+      <thead><tr><th>When</th><th>From → To</th><th>Result</th></tr></thead>
+      <tbody>
+      {% for h in history %}
+        <tr>
+          <td class="nowrap muted">{{ ago(h.unix_time) }}</td>
+          <td class="clip"><span title="{{ h.subject }}">{{ h.sender_mime or h.sender_smtp }}</span><br><small class="muted">→ {{ (h.rcpt_mime or h.rcpt_smtp or [])|join(', ') }}</small></td>
+          <td><span class="badge {{ 'ok' if h.action == 'no action' else ('error' if h.action == 'reject' else 'warn') }}">{{ h.action }}</span> <small class="muted">{{ '%.1f' % (h.score or 0) }}</small></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">No messages yet.</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

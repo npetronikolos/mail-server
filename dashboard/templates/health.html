@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Health checks{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>Health checks</h1><p class="muted">Services, network, certificates, blocklists and every DNS record.</p></div>
+  <button class="btn" data-health-refresh>Run again</button>
+</header>
+<div id="health" data-src="{{ url_for('api_health') }}">
+  <div class="card loading">Running checks… this takes up to 30 seconds.</div>
+</div>
+{% endblock %}

@@ -1,0 +1,18 @@
+# Managed by mail-server install.sh
+[Unit]
+Description=Mail server admin dashboard
+After=network.target dovecot.service
+
+[Service]
+User=mail-dashboard
+Group=mail-dashboard
+WorkingDirectory=/opt/mail-dashboard
+Environment=SCRIPT_NAME=/admin
+ExecStart={{GUNICORN}} --workers 1 --threads 8 --bind 127.0.0.1:8090 --timeout 330 --access-logfile - app:app
+Restart=on-failure
+RestartSec=3
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

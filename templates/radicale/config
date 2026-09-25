@@ -1,0 +1,20 @@
+# Managed by mail-server install.sh
+# Calendars and contacts. nginx checks the password (via the dashboard) and
+# passes the signed-in email address in the X-Remote-User header.
+[server]
+hosts = 127.0.0.1:5232
+
+[auth]
+type = http_x_remote_user
+
+[rights]
+type = owner_only
+
+[storage]
+filesystem_folder = /var/lib/radicale/collections
+
+[web]
+type = internal
+
+[logging]
+level = warning

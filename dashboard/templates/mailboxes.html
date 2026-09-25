@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Mailboxes{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>Mailboxes</h1><p class="muted">{{ users|length }} mailbox{{ 'es' if users|length != 1 }}</p></div>
+  <input type="search" class="filter" data-filter="#mbx" placeholder="Search…" aria-label="Search mailboxes">
+</header>
+
+<details class="card add" {{ 'open' if not users }}>
+  <summary><span class="btn primary">+ New mailbox</span></summary>
+  <form method="post" action="{{ url_for('mailbox_add') }}" class="formgrid">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Address
+      <span class="joined"><input name="local" placeholder="anna" required pattern="[A-Za-z0-9._%+-]+"><select name="domain">{% for d in domains %}<option>{{ d.domain }}</option>{% endfor %}</select></span>
+    </label>
+    <label>Password <small class="muted">(at least 10 characters)</small>
+      <input name="password" type="password" minlength="10" autocomplete="new-password" data-pw>
+    </label>
+    <label class="check"><input type="checkbox" name="generate" value="1" data-gen> Generate a strong password for me</label>
+    <label>Storage limit <small class="muted">(e.g. 2G, 500M; empty = unlimited)</small>
+      <input name="quota" value="{{ default_quota }}" placeholder="unlimited" pattern="[0-9]+[KMGTkmgt]?|none|">
+    </label>
+    <button class="btn primary">Create mailbox</button>
+  </form>
+</details>
+
+<section class="card">
+  <table id="mbx">
+    <thead><tr><th>Mailbox</th><th>Storage</th><th>Messages</th><th></th></tr></thead>
+    <tbody>
+    {% for u in users %}
+      <tr>
+        <td><strong>{{ u.email }}</strong>
+          {% if u.admin %}<span class="badge">admin</span>{% endif %}
+          {% if u.totp %}<span class="badge ok" title="Two-factor sign-in for the dashboard">2FA</span>{% endif %}
+        </td>
+        <td class="usage">
+          {% if u.quota_bytes %}
+            <meter min="0" max="{{ u.quota_bytes }}" low="{{ u.quota_bytes * 0.8 }}" high="{{ u.quota_bytes * 0.95 }}" optimum="0" value="{{ u.used_bytes }}"></meter>
+            <small>{{ human(u.used_bytes) }} of {{ u.quota }}</small>
+          {% else %}
+            <small>{{ human(u.used_bytes) }} · unlimited</small>
+          {% endif %}
+        </td>
+        <td>{{ u.messages if u.messages is not none else '–' }}</td>
+        <td class="actions">
+          <details class="menu-d">
+            <summary class="btn small">Manage</summary>
+            <div class="pop">
+              <form method="post" action="{{ url_for('mailbox_password', email=u.email) }}">
+                <input type="hidden" name="csrf" value="{{ csrf }}">
+                <label>New password<input name="password" type="password" minlength="10" autocomplete="new-password" data-pw></label>
+                <label class="check"><input type="checkbox" name="generate" value="1" data-gen> Generate one</label>
+                <button class="btn small">Set password</button>
+              </form>
+              <form method="post" action="{{ url_for('mailbox_quota', email=u.email) }}" class="row">
+                <input type="hidden" name="csrf" value="{{ csrf }}">
+                <input name="quota" value="{{ u.quota }}" placeholder="unlimited" size="8" aria-label="Storage limit">
+                <button class="btn small">Set limit</button>
+              </form>
+              <form method="post" action="{{ url_for('mailbox_admin', email=u.email) }}">
+                <input type="hidden" name="csrf" value="{{ csrf }}">
+                <input type="hidden" name="make" value="{{ '0' if u.admin else '1' }}">
+                <button class="btn small">{{ 'Remove admin rights' if u.admin else 'Make admin' }}</button>
+              </form>
+              {% if u.totp %}
+              <form method="post" action="{{ url_for('mailbox_reset_2fa', email=u.email) }}" data-confirm="Turn off two-factor sign-in for {{ u.email }}?">
+                <input type="hidden" name="csrf" value="{{ csrf }}">
+                <button class="btn small">Reset 2FA</button>
+              </form>
+              {% endif %}
+              {% if u.email != me %}
+              <form method="post" action="{{ url_for('mailbox_delete', email=u.email) }}" data-confirm="Delete {{ u.email }}?">
+                <input type="hidden" name="csrf" value="{{ csrf }}">
+                <label class="check"><input type="checkbox" name="purge" value="1"> Also delete all its mail</label>
+                <button class="btn small danger">Delete mailbox</button>
+              </form>
+              {% endif %}
+            </div>
+          </details>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

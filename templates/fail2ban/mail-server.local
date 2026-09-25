@@ -26,3 +26,10 @@ enabled = {{WEBMAIL_JAIL}}
 backend = auto
 logpath = /var/log/roundcube/errors.log
 port    = http,https
+
+[mail-dashboard]
+enabled = {{DASHBOARD_JAIL}}
+backend = auto
+filter  = mail-dashboard
+logpath = /var/log/mail-dashboard/auth.log
+port    = http,https

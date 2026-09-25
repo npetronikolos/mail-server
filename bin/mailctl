@@ -1,436 +1,1353 @@
-#!/usr/bin/env bash
-# mailctl - manage the mail server installed by install.sh
-#
-# Run "mailctl help" for usage.
-set -euo pipefail
+#!/usr/bin/env python3
+"""mailctl - manage the mail server installed by install.sh.
 
-CONF=/etc/mail-server/mail-server.conf
-USERS_FILE=/etc/dovecot/users
-VDOMAINS=/etc/postfix/vdomains
-VMAILBOX=/etc/postfix/vmailbox
-VALIASES=/etc/postfix/virtual
-SENDER_LOGIN=/etc/postfix/sender_login
-DKIM_DIR=/var/lib/rspamd/dkim
-VMAIL_DIR=/var/vmail
-LOCK_FILE=/run/mailctl.lock
+Run "mailctl help" for usage. Add --json to any command for machine-readable
+output (used by the admin dashboard).
+"""
+import base64
+import datetime
+import fcntl
+import getpass
+import glob
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
 
-die()  { echo "mailctl: $*" >&2; exit 1; }
-info() { echo "==> $*"; }
+CONF = "/etc/mail-server/mail-server.conf"
+USERS_FILE = "/etc/dovecot/users"
+VDOMAINS = "/etc/postfix/vdomains"
+VMAILBOX = "/etc/postfix/vmailbox"
+VALIASES = "/etc/postfix/virtual"
+SENDER_LOGIN = "/etc/postfix/sender_login"
+ADMINS_FILE = "/etc/mail-server/admins"
+AUDIT_LOG = "/var/log/mailctl.log"
+DKIM_DIR = "/var/lib/rspamd/dkim"
+VMAIL_DIR = "/var/vmail"
+MTA_STS_FILE = "/var/www/mail-autoconfig/mta-sts.txt"
+LOCK_FILE = "/run/mailctl.lock"
 
-[[ $EUID -eq 0 ]] || die "must be run as root (use sudo)"
-[[ -r $CONF ]] || die "$CONF not found - run install.sh first"
-# shellcheck source=/dev/null
-source "$CONF"
-DKIM_SELECTOR=${DKIM_SELECTOR:-mail}
+EMAIL_RE = re.compile(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$")
+DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$")
+QUOTA_RE = re.compile(r"^[0-9]+[KMGT]?$")
+QUEUE_ID_RE = re.compile(r"^[0-9A-Za-z]{6,}$")
 
-# Serialise all changes so two mailctl runs never clobber each other's edits.
-exec 9>"$LOCK_FILE"
-flock 9
+SERVICES = ["postfix", "dovecot", "rspamd", "redis-server", "unbound", "nginx",
+            "fail2ban", "clamav-daemon", "clamav-freshclam",
+            "postfix-mta-sts-resolver", "radicale", "mail-dashboard"]
 
-usage() {
-  cat <<EOF
-Usage: mailctl <command> [arguments]
+JSON = False
+ACTOR = None
+C = {}
+
+
+class Fail(Exception):
+    pass
+
+
+# ------------------------------------------------------------------ basics
+
+def load_conf():
+    conf = {}
+    try:
+        with open(CONF) as f:
+            for line in f:
+                m = re.match(r"^\s*([A-Z0-9_]+)=(.*)$", line)
+                if not m:
+                    continue
+                v = m.group(2).strip()
+                if v[:1] in "\"'":
+                    end = v.find(v[0], 1)
+                    v = v[1:end] if end > 0 else v[1:]
+                else:
+                    v = v.split("#", 1)[0].strip()
+                conf[m.group(1)] = v
+    except FileNotFoundError:
+        raise Fail(f"{CONF} not found - run install.sh first")
+    defaults = {"DKIM_SELECTOR": "mail", "SERVER_IPV6": "", "CERT_MODE": "letsencrypt",
+                "ENABLE_MTA_STS": "yes", "ENABLE_DAV": "yes", "DEFAULT_QUOTA": "",
+                "BACKUP_DIR": "/var/backups/mail-server"}
+    for k, v in defaults.items():
+        if not conf.get(k):
+            conf[k] = v
+    for k in ("DOMAIN", "MAIL_HOSTNAME", "ADMIN_EMAIL"):
+        conf[k] = conf.get(k, "").lower()
+    return conf
+
+
+def run(cmd, input=None, check=True, timeout=120):
+    try:
+        p = subprocess.run(cmd, input=input, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        if check:
+            raise Fail(f"command not found: {cmd[0]}")
+        return subprocess.CompletedProcess(cmd, 127, "", "")
+    except subprocess.TimeoutExpired:
+        if check:
+            raise Fail(f"timed out: {' '.join(cmd)}")
+        return subprocess.CompletedProcess(cmd, 124, "", "timeout")
+    if check and p.returncode != 0:
+        raise Fail(f"{' '.join(cmd[:3])} failed: {(p.stderr or p.stdout).strip()}")
+    return p
+
+
+def info(msg):
+    if not JSON:
+        print(f"==> {msg}")
+
+
+def audit(action):
+    who = ACTOR or os.environ.get("SUDO_USER") or "root"
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(AUDIT_LOG, "a") as f:
+            f.write(f"{stamp}\t{who}\t{action}\n")
+        os.chmod(AUDIT_LOG, 0o640)
+    except OSError:
+        pass
+
+
+def lower_email(value, what="email address"):
+    v = (value or "").strip().lower()
+    if not EMAIL_RE.match(v):
+        raise Fail(f"invalid {what}: {value or '<none>'}")
+    return v
+
+
+def lower_domain(value):
+    v = (value or "").strip().lower()
+    if not DOMAIN_RE.match(v):
+        raise Fail(f"invalid domain: {value or '<none>'}")
+    return v
+
+
+def domain_of(email):
+    return email.split("@", 1)[1]
+
+
+def human_bytes(n):
+    if n is None:
+        return "-"
+    n = float(n)
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024 or unit == "T":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return str(n)
+
+
+def quota_to_bytes(q):
+    if not q:
+        return None
+    mult = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    if q[-1] in mult:
+        return int(q[:-1]) * mult[q[-1]]
+    return int(q)
+
+
+def normalize_quota(q):
+    q = (q or "").strip().upper().replace(" ", "")
+    if q in ("", "0", "NONE", "UNLIMITED"):
+        return ""
+    if len(q) > 2 and q.endswith("B") and q[-2] in "KMGT":
+        q = q[:-1]
+    if not QUOTA_RE.match(q):
+        raise Fail(f"invalid quota '{q}': use a size like 500M, 2G or 'none'")
+    return q
+
+
+# ------------------------------------------------------------------ map files
+
+def read_map(path):
+    rows = []
+    try:
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                if parts:
+                    rows.append((parts[0], parts[1] if len(parts) > 1 else ""))
+    except FileNotFoundError:
+        pass
+    return rows
+
+
+def write_file(path, text, mode=0o644, like=None):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=os.path.basename(path) + ".")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    if like and os.path.exists(like):
+        st = os.stat(like)
+        os.chmod(tmp, st.st_mode & 0o7777)
+        os.chown(tmp, st.st_uid, st.st_gid)
+    else:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def write_map(path, rows):
+    write_file(path, "".join(f"{k} {v}\n" for k, v in rows), like=path)
+
+
+def map_keys(path):
+    return {k for k, _ in read_map(path)}
+
+
+def rebuild_sender_login():
+    """Which login may use which From: address: own address + aliases to it."""
+    owners = {}
+    for k, _ in read_map(VMAILBOX):
+        owners.setdefault(k, []).append(k)
+    for k, v in read_map(VALIASES):
+        owners.setdefault(k, []).extend(x for x in v.split(",") if x)
+    rows = sorted((k, ",".join(dict.fromkeys(v))) for k, v in owners.items())
+    write_file(SENDER_LOGIN, "".join(f"{k} {v}\n" for k, v in rows), mode=0o644)
+
+
+def postmap_all():
+    rebuild_sender_login()
+    for f in (VDOMAINS, VMAILBOX, VALIASES, SENDER_LOGIN):
+        run(["postmap", f"hash:{f}"])
+
+
+# ------------------------------------------------------------------ users file
+
+def dovecot_version():
+    p = run(["dovecot", "--version"], check=False)
+    m = re.match(r"(\d+)\.(\d+)", p.stdout or "")
+    return (int(m.group(1)), int(m.group(2))) if m else (2, 3)
+
+
+def quota_field(q):
+    if not q:
+        return ""
+    if dovecot_version() >= (2, 4):
+        return f"userdb_quota_storage_size={q}"
+    return f"userdb_quota_rule=*:storage={q}"
+
+
+def parse_quota(extra):
+    m = re.search(r"userdb_quota_storage_size=(\S+)", extra) or \
+        re.search(r"userdb_quota_rule=\*:storage=(\S+)", extra)
+    return m.group(1) if m else ""
+
+
+def read_users():
+    users = []
+    try:
+        with open(USERS_FILE) as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                parts = line.split(":", 7)
+                parts += [""] * (8 - len(parts))
+                users.append({"email": parts[0], "hash": parts[1], "quota": parse_quota(parts[7])})
+    except FileNotFoundError:
+        pass
+    return users
+
+
+def write_users(users):
+    """Atomically replace the users file.
+
+    Dovecot re-reads it when its size or modification time (whole seconds)
+    changes, so make sure the modification time always moves forward.
+    """
+    old = int(os.stat(USERS_FILE).st_mtime) if os.path.exists(USERS_FILE) else 0
+    text = "".join(f"{u['email']}:{u['hash']}::::::{quota_field(u['quota'])}\n" for u in users)
+    write_file(USERS_FILE, text, mode=0o640, like=USERS_FILE)
+    if int(os.stat(USERS_FILE).st_mtime) <= old:
+        os.utime(USERS_FILE, (old + 1, old + 1))
+
+
+def dovecot_sees(email, password=None, deleted=False):
+    """True once Dovecot serves the current users file for this mailbox."""
+    if deleted:
+        p = run(["doveadm", "user", email], check=False, timeout=15)
+        return p.returncode != 0 and "doesn't exist" in (p.stdout + p.stderr)
+    if password is not None:
+        p = run(["doveadm", "auth", "test", email, password], check=False, timeout=30)
+        return p.returncode == 0
+    return run(["doveadm", "user", email], check=False, timeout=15).returncode == 0
+
+
+def sync_dovecot(email, password=None, deleted=False):
+    """Return only once Dovecot really uses the change.
+
+    Dovecot re-reads the users file at most once per second, so a lookup made
+    earlier in the same second as a change (e.g. checking the old password
+    just before setting a new one) keeps seeing the old file until the next
+    second. Wait for that, then prove the change is live; nudge the file's
+    timestamp and retry, and as a last resort reload Dovecot.
+    """
+    if not shutil.which("doveadm"):
+        return
+    for attempt in range(3):
+        time.sleep(1.05 - time.time() % 1)
+        if dovecot_sees(email, password, deleted):
+            return
+        t = time.time() + 1
+        os.utime(USERS_FILE, (t, t))
+    run(["doveadm", "reload"], check=False)
+    time.sleep(1.5)
+
+
+def find_user(users, email):
+    return next((u for u in users if u["email"] == email), None)
+
+
+def read_password(email):
+    if sys.stdin.isatty():
+        pw = getpass.getpass(f"Password for {email}: ")
+        if pw != getpass.getpass("Repeat password: "):
+            raise Fail("passwords do not match")
+    else:
+        pw = sys.stdin.readline().rstrip("\n")
+    if len(pw) < 10:
+        raise Fail("password must be at least 10 characters")
+    if ":" in pw:
+        raise Fail("password must not contain ':'")
+    return pw
+
+
+def hash_password(pw):
+    # The password goes in on stdin so it never shows up in the process list.
+    p = run(["openssl", "passwd", "-6", "-stdin"], input=pw + "\n")
+    return "{SHA512-CRYPT}" + p.stdout.strip()
+
+
+def quota_usage():
+    """{email: {"used": bytes, "messages": n}} for every mailbox, from Dovecot."""
+    usage = {}
+    p = run(["doveadm", "-f", "tab", "quota", "get", "-A"], check=False, timeout=120)
+    if p.returncode != 0:
+        return usage
+    for line in p.stdout.splitlines()[1:]:
+        cols = line.split("\t")
+        if len(cols) < 5:
+            continue
+        email, _, kind, value = cols[:4]
+        u = usage.setdefault(email, {"used": 0, "messages": 0})
+        if kind == "STORAGE" and value.isdigit():
+            u["used"] = int(value) * 1024
+        elif kind == "MESSAGE" and value.isdigit():
+            u["messages"] = int(value)
+    return usage
+
+
+# ------------------------------------------------------------------ users
+
+def user_add(email, quota=None):
+    email = lower_email(email)
+    if domain_of(email) not in map_keys(VDOMAINS):
+        raise Fail(f"domain {domain_of(email)} is not hosted here (mailctl domain add ...)")
+    users = read_users()
+    if find_user(users, email):
+        raise Fail(f"{email} already exists")
+    if email in map_keys(VALIASES):
+        raise Fail(f"{email} is already an alias")
+    q = normalize_quota(C.get("DEFAULT_QUOTA", "") if quota is None else quota)
+    pw = read_password(email)
+    h = hash_password(pw)
+    users.append({"email": email, "hash": h, "quota": q})
+    write_users(users)
+    sync_dovecot(email, password=pw)
+    write_map(VMAILBOX, read_map(VMAILBOX) + [(email, "OK")])
+    postmap_all()
+    # Create the mailbox right away so the default folders exist.
+    run(["doveadm", "mailbox", "list", "-u", email], check=False)
+    audit(f"user add {email} quota={q or 'unlimited'}")
+    info(f"created mailbox {email}" + (f" (quota {q})" if q else ""))
+    return {"email": email, "quota": q}
+
+
+def user_passwd(email):
+    email = lower_email(email)
+    users = read_users()
+    u = find_user(users, email)
+    if not u:
+        raise Fail(f"no such mailbox: {email}")
+    pw = read_password(email)
+    u["hash"] = hash_password(pw)
+    write_users(users)
+    sync_dovecot(email, password=pw)
+    audit(f"user passwd {email}")
+    info(f"password changed for {email}")
+    return {"email": email}
+
+
+def user_quota(email, quota):
+    email = lower_email(email)
+    users = read_users()
+    u = find_user(users, email)
+    if not u:
+        raise Fail(f"no such mailbox: {email}")
+    u["quota"] = normalize_quota(quota)
+    write_users(users)
+    audit(f"user quota {email} {u['quota'] or 'unlimited'}")
+    info(f"quota for {email}: {u['quota'] or 'unlimited'}")
+    return {"email": email, "quota": u["quota"]}
+
+
+def user_del(email, purge=False):
+    email = lower_email(email)
+    users = read_users()
+    if not find_user(users, email):
+        raise Fail(f"no such mailbox: {email}")
+    write_users([u for u in users if u["email"] != email])
+    sync_dovecot(email, deleted=True)
+    write_map(VMAILBOX, [r for r in read_map(VMAILBOX) if r[0] != email])
+    postmap_all()
+    run(["doveadm", "kick", email], check=False)
+    admins = read_admins()
+    if email in admins:
+        write_admins([a for a in admins if a != email])
+    d = os.path.join(VMAIL_DIR, domain_of(email), email.split("@")[0])
+    if purge:
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(os.path.join("/var/lib/radicale/collections/collection-root", email),
+                      ignore_errors=True)
+        info(f"removed mailbox {email} and deleted its mail")
+    else:
+        info(f"removed mailbox {email} (mail kept in {d}; use --purge to delete)")
+    audit(f"user del {email}" + (" --purge" if purge else ""))
+    return {"email": email, "purged": purge}
+
+
+def user_list():
+    usage = quota_usage()
+    admins = set(read_admins())
+    out = []
+    for u in read_users():
+        us = usage.get(u["email"])
+        if us is None:
+            d = os.path.join(VMAIL_DIR, domain_of(u["email"]), u["email"].split("@")[0])
+            p = run(["du", "-sb", d], check=False)
+            us = {"used": int(p.stdout.split()[0]) if p.returncode == 0 and p.stdout else 0,
+                  "messages": None}
+        out.append({"email": u["email"], "quota": u["quota"],
+                    "quota_bytes": quota_to_bytes(u["quota"]),
+                    "used_bytes": us["used"], "messages": us["messages"],
+                    "admin": u["email"] in admins})
+    return out
+
+
+def user_info(email):
+    email = lower_email(email)
+    for u in user_list():
+        if u["email"] == email:
+            u["aliases"] = [a["alias"] for a in alias_list() if email in a["destinations"]]
+            return u
+    raise Fail(f"no such mailbox: {email}")
+
+
+# ------------------------------------------------------------------ aliases
+
+def alias_add(alias, dests):
+    alias = (alias or "").strip().lower()
+    if alias.startswith("@"):
+        lower_domain(alias[1:])
+    else:
+        alias = lower_email(alias, "alias address")
+    if domain_of(alias) not in map_keys(VDOMAINS):
+        raise Fail(f"domain {domain_of(alias)} is not hosted here")
+    if find_user(read_users(), alias):
+        raise Fail(f"{alias} is a mailbox; delete it first or pick another address")
+    if alias in map_keys(VALIASES):
+        raise Fail(f"alias {alias} already exists (delete it first to change it)")
+    targets = [lower_email(d, "destination address")
+               for d in re.split(r"[,\s]+", (dests or "").strip()) if d]
+    if not targets:
+        raise Fail("usage: mailctl alias add <alias> <dest>[,<dest>...]")
+    targets = list(dict.fromkeys(targets))
+    write_map(VALIASES, read_map(VALIASES) + [(alias, ",".join(targets))])
+    postmap_all()
+    audit(f"alias add {alias} -> {','.join(targets)}")
+    info(f"alias {alias} -> {','.join(targets)}")
+    return {"alias": alias, "destinations": targets}
+
+
+def alias_del(alias):
+    alias = (alias or "").strip().lower()
+    if alias not in map_keys(VALIASES):
+        raise Fail(f"no such alias: {alias or '<none>'}")
+    write_map(VALIASES, [r for r in read_map(VALIASES) if r[0] != alias])
+    postmap_all()
+    audit(f"alias del {alias}")
+    info(f"removed alias {alias}")
+    return {"alias": alias}
+
+
+def alias_list():
+    return [{"alias": k, "destinations": v.split(",")} for k, v in read_map(VALIASES)]
+
+
+# ------------------------------------------------------------------ domains
+
+def dkim_key_path(domain):
+    return os.path.join(DKIM_DIR, f"{domain}.{C['DKIM_SELECTOR']}.key")
+
+
+def dkim_public(domain):
+    key = dkim_key_path(domain)
+    if not os.path.exists(key):
+        return None
+    p = subprocess.run(["openssl", "pkey", "-in", key, "-pubout", "-outform", "DER"],
+                       capture_output=True)
+    return base64.b64encode(p.stdout).decode() if p.returncode == 0 else None
+
+
+def domain_add(domain):
+    domain = lower_domain(domain)
+    if domain in map_keys(VDOMAINS):
+        raise Fail(f"{domain} is already hosted here")
+    key = dkim_key_path(domain)
+    os.makedirs(DKIM_DIR, exist_ok=True)
+    if not os.path.exists(key):
+        run(["rspamadm", "dkim_keygen", "-b", "2048", "-s", C["DKIM_SELECTOR"],
+             "-d", domain, "-k", key])
+        shutil.chown(key, "_rspamd", "_rspamd")
+        os.chmod(key, 0o640)
+    write_map(VDOMAINS, read_map(VDOMAINS) + [(domain, "OK")])
+    d = os.path.join(VMAIL_DIR, domain)
+    os.makedirs(d, exist_ok=True)
+    shutil.chown(d, "vmail", "vmail")
+    os.chmod(d, 0o750)
+    # Standard role addresses (RFC 2142) go to the administrator.
+    users = {u["email"] for u in read_users()}
+    aliases = read_map(VALIASES)
+    keys = {k for k, _ in aliases}
+    for role in ("postmaster", "abuse"):
+        a = f"{role}@{domain}"
+        if a not in users and a not in keys and C.get("ADMIN_EMAIL"):
+            aliases.append((a, C["ADMIN_EMAIL"]))
+    write_map(VALIASES, aliases)
+    # Rspamd reads the key file when it signs, so no reload is needed.
+    postmap_all()
+    audit(f"domain add {domain}")
+    info(f"now hosting {domain}")
+    return {"domain": domain, "records": dns_records(domain)}
+
+
+def domain_del(domain):
+    domain = lower_domain(domain)
+    if domain not in map_keys(VDOMAINS):
+        raise Fail(f"no such domain: {domain}")
+    if domain == C["DOMAIN"]:
+        raise Fail(f"refusing to remove the primary domain {domain}")
+    if any(domain_of(u["email"]) == domain for u in read_users()):
+        raise Fail(f"{domain} still has mailboxes; delete them first (mailctl user list)")
+    write_map(VDOMAINS, [r for r in read_map(VDOMAINS) if r[0] != domain])
+    write_map(VALIASES, [r for r in read_map(VALIASES) if domain_of(r[0]) != domain])
+    postmap_all()
+    audit(f"domain del {domain}")
+    info(f"stopped hosting {domain} (DKIM key kept in {DKIM_DIR})")
+    return {"domain": domain}
+
+
+def domain_list():
+    users = read_users()
+    aliases = read_map(VALIASES)
+    return [{"domain": d, "primary": d == C["DOMAIN"],
+             "mailboxes": sum(1 for u in users if domain_of(u["email"]) == d),
+             "aliases": sum(1 for k, _ in aliases if domain_of(k) == d)}
+            for d, _ in read_map(VDOMAINS)]
+
+
+# ------------------------------------------------------------------ DNS
+
+def mta_sts_id():
+    try:
+        mtime = os.stat(MTA_STS_FILE).st_mtime
+    except FileNotFoundError:
+        return "1"
+    return datetime.datetime.fromtimestamp(mtime).strftime("%Y%m%d%H%M%S")
+
+
+def dns_records(domain=None):
+    """The DNS records a domain needs."""
+    domain = lower_domain(domain or C["DOMAIN"])
+    if domain not in map_keys(VDOMAINS):
+        raise Fail(f"{domain} is not hosted here")
+    host = C["MAIL_HOSTNAME"]
+    recs = []
+
+    def add(rtype, name, value, purpose, required=True, fqdn=None):
+        if fqdn is None:
+            fqdn = domain if name == "@" else f"{name}.{domain}"
+        recs.append({"type": rtype, "name": name, "fqdn": fqdn, "value": value,
+                     "purpose": purpose, "required": required})
+
+    if domain == C["DOMAIN"]:
+        add("A", host + ".", C["SERVER_IPV4"], "Where the mail server is", fqdn=host)
+        if C.get("SERVER_IPV6"):
+            add("AAAA", host + ".", C["SERVER_IPV6"], "Mail server (IPv6)", fqdn=host)
+    add("MX", "@", f"10 {host}.", "Mail for this domain goes to this server")
+    add("TXT", "@", "v=spf1 mx -all", "SPF: only this server may send for the domain")
+    pub = dkim_public(domain)
+    if pub:
+        add("TXT", f"{C['DKIM_SELECTOR']}._domainkey", f"v=DKIM1; k=rsa; p={pub}",
+            "DKIM: proves mail really came from you")
+    add("TXT", "_dmarc", f"v=DMARC1; p=quarantine; rua=mailto:postmaster@{domain}; adkim=r; aspf=r",
+        "DMARC: tells receivers what to do with forged mail")
+    if C.get("ENABLE_MTA_STS") == "yes":
+        add("CNAME", "mta-sts", f"{host}.", "MTA-STS policy host", required=False)
+        add("TXT", "_mta-sts", f"v=STSv1; id={mta_sts_id()}",
+            "MTA-STS: senders must use encrypted connections", required=False)
+        add("TXT", "_smtp._tls", f"v=TLSRPTv1; rua=mailto:postmaster@{domain}",
+            "TLS-RPT: reports about encryption problems", required=False)
+    add("SRV", "_imaps._tcp", f"0 1 993 {host}.", "Mail app auto-setup (IMAP)", required=False)
+    add("SRV", "_submissions._tcp", f"0 1 465 {host}.", "Mail app auto-setup (SMTP)", required=False)
+    add("SRV", "_submission._tcp", f"0 1 587 {host}.", "Mail app auto-setup (SMTP)", required=False)
+    add("CNAME", "autoconfig", f"{host}.", "Thunderbird auto-setup", required=False)
+    add("CNAME", "autodiscover", f"{host}.", "Outlook auto-setup", required=False)
+    if C.get("ENABLE_DAV") == "yes":
+        add("SRV", "_caldavs._tcp", f"0 1 443 {host}.", "Calendar auto-setup", required=False)
+        add("SRV", "_carddavs._tcp", f"0 1 443 {host}.", "Contacts auto-setup", required=False)
+    return recs
+
+
+def dig(name, rtype, server=None):
+    """Answers for a DNS query: a list (empty if the name has no such record),
+    or None when the lookup itself failed (timeout, SERVFAIL...)."""
+    cmd = ["dig", "+noall", "+answer", "+comments", "+time=3", "+tries=2", rtype, name]
+    if server:
+        cmd.insert(1, f"@{server}")
+    p = run(cmd, check=False, timeout=20)
+    m = re.search(r"status: (\w+)", p.stdout or "")
+    if p.returncode != 0 or not m or m.group(1) not in ("NOERROR", "NXDOMAIN"):
+        return None
+    out = []
+    for line in p.stdout.splitlines():
+        parts = line.split(None, 4)
+        if line.startswith(";") or len(parts) < 5 or parts[3] != rtype:
+            continue
+        value = parts[4].strip()
+        if rtype == "TXT":
+            value = "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', value))
+        out.append(value)
+    return out
+
+
+def check_record(rec):
+    host = C["MAIL_HOSTNAME"]
+    t, want = rec["type"], rec["value"]
+    found = dig(rec["fqdn"], "A" if t == "CNAME" else t)
+    if found is None:
+        return "warn", "DNS lookup failed", []
+    status, note = "ok", ""
+    if t in ("A", "AAAA"):
+        if want not in found:
+            status, note = "error", "does not point to this server"
+    elif t == "MX":
+        targets = [x.split()[-1].rstrip(".").lower() for x in found if x.split()]
+        if host not in targets:
+            status, note = "error", f"MX must point to {host}"
+    elif t == "TXT":
+        prefix = want.split(";")[0].split(" ")[0]
+        found = [x for x in found if x.startswith(prefix)]
+        if not found:
+            status, note = "error", "missing"
+        elif prefix == "v=spf1":
+            spf = found[0]
+            if len(found) > 1:
+                status, note = "error", "more than one SPF record"
+            elif not (re.search(r"(^|\s)\+?mx(\s|$)", spf) or f"ip4:{C['SERVER_IPV4']}" in spf
+                      or f"a:{host}" in spf):
+                status, note = "error", "SPF does not allow this server"
+        elif prefix == "v=DKIM1":
+            want_p = want.split("p=", 1)[1]
+            if not any(x.replace(" ", "").endswith("p=" + want_p) for x in found):
+                status, note = "error", "key does not match this server's DKIM key"
+        elif prefix == "v=STSv1" and want not in found:
+            status, note = "warn", "id differs from the current policy; update it"
+    elif t == "CNAME":
+        if C["SERVER_IPV4"] not in found:
+            status, note = "error", "does not point to this server"
+    elif t == "SRV":
+        if not any(x.rstrip(".").lower().endswith(host) for x in found):
+            status, note = "error", "missing"
+    if status == "error" and not rec["required"]:
+        status = "warn"
+    return status, note, found
+
+
+def dns_check(domain=None):
+    domain = lower_domain(domain or C["DOMAIN"])
+    results = []
+    for rec in dns_records(domain):
+        status, note, found = check_record(rec)
+        results.append(dict(rec, status=status, note=note, found=found))
+    if domain == C["DOMAIN"]:
+        ptr = dig(ipaddress.ip_address(C["SERVER_IPV4"]).reverse_pointer, "PTR") or []
+        ok = any(x.rstrip(".").lower() == C["MAIL_HOSTNAME"] for x in ptr)
+        results.append({"type": "PTR", "name": C["SERVER_IPV4"], "fqdn": C["SERVER_IPV4"],
+                        "value": C["MAIL_HOSTNAME"], "required": True,
+                        "purpose": "Reverse DNS - set at your hosting provider",
+                        "status": "ok" if ok else "error",
+                        "note": "" if ok else "set it in your hosting provider's control panel",
+                        "found": ptr})
+    return results
+
+
+# ------------------------------------------------------------------ status & checks
+
+def service_state(name):
+    p = run(["systemctl", "show", "-p", "LoadState", "--value", name], check=False)
+    if p.stdout.strip() != "loaded":
+        return None
+    return run(["systemctl", "is-active", name], check=False).stdout.strip() or "unknown"
+
+
+def php_fpm_unit():
+    p = run(["systemctl", "list-units", "--type=service", "--all", "--no-legend", "--plain",
+             "php*-fpm.service"], check=False)
+    for line in p.stdout.splitlines():
+        if line.split():
+            return line.split()[0].removesuffix(".service")
+    return None
+
+
+def cert_info():
+    p = run(["postconf", "-h", "smtpd_tls_chain_files"], check=False)
+    parts = [x.strip() for x in p.stdout.split(",")]
+    cert = parts[1] if len(parts) > 1 else ""
+    if not cert or not os.path.exists(cert):
+        return None
+    end = run(["openssl", "x509", "-in", cert, "-noout", "-enddate"], check=False).stdout
+    san = run(["openssl", "x509", "-in", cert, "-noout", "-ext", "subjectAltName"], check=False).stdout
+    issuer = run(["openssl", "x509", "-in", cert, "-noout", "-issuer"], check=False).stdout
+    exp = end.strip().split("=", 1)[-1]
+    try:
+        dt = datetime.datetime.strptime(exp, "%b %d %H:%M:%S %Y %Z")
+        days = (dt - datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)).days
+    except ValueError:
+        dt, days = None, None
+    m = re.search(r"O\s*=\s*([^,]+)", issuer) or re.search(r"CN\s*=\s*([^,]+)", issuer)
+    return {"path": cert, "expires": dt.isoformat() if dt else exp, "days_left": days,
+            "names": re.findall(r"DNS:([^,\s]+)", san),
+            "issuer": m.group(1).strip() if m else issuer.strip()}
+
+
+def queue_list():
+    p = run(["postqueue", "-j"], check=False)
+    items = []
+    for line in p.stdout.splitlines():
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        items.append({
+            "id": m.get("queue_id"), "queue": m.get("queue_name"),
+            "arrival": datetime.datetime.fromtimestamp(m.get("arrival_time", 0)).isoformat(),
+            "size": m.get("message_size"), "sender": m.get("sender"),
+            "recipients": [{"address": r.get("address"), "reason": r.get("delay_reason", "")}
+                           for r in m.get("recipients", [])]})
+    return items
+
+
+def status():
+    services = {}
+    for s in SERVICES:
+        st = service_state(s)
+        if st is not None:
+            services[s] = st
+    fpm = php_fpm_unit()
+    if fpm:
+        services[fpm] = run(["systemctl", "is-active", fpm], check=False).stdout.strip()
+    du = shutil.disk_usage(VMAIL_DIR if os.path.isdir(VMAIL_DIR) else "/")
+    vm = run(["du", "-sb", VMAIL_DIR], check=False).stdout.split()
+    mem = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                mem[k] = int(v.split()[0]) * 1024
+    except OSError:
+        pass
+    try:
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+    except OSError:
+        uptime = 0
+    return {
+        "hostname": C["MAIL_HOSTNAME"], "primary_domain": C["DOMAIN"],
+        "server_ipv4": C["SERVER_IPV4"],
+        "services": services, "certificate": cert_info(),
+        "counts": {"domains": len(read_map(VDOMAINS)), "mailboxes": len(read_users()),
+                   "aliases": len(read_map(VALIASES)), "queue": len(queue_list())},
+        "disk": {"total": du.total, "free": du.free, "vmail": int(vm[0]) if vm else 0},
+        "memory": {"total": mem.get("MemTotal", 0), "available": mem.get("MemAvailable", 0)},
+        "load": list(os.getloadavg()), "cpus": os.cpu_count(),
+        "uptime_seconds": int(uptime),
+        "reboot_required": os.path.exists("/var/run/reboot-required"),
+    }
+
+
+def blocklist_check():
+    rev = ".".join(reversed(C["SERVER_IPV4"].split(".")))
+    p = run(["dig", "@127.0.0.1", "+time=3", "+tries=2", "A", f"{rev}.zen.spamhaus.org"],
+            check=False, timeout=20)
+    m = re.search(r"status: (\w+)", p.stdout or "")
+    if p.returncode != 0 or not m or m.group(1) not in ("NOERROR", "NXDOMAIN"):
+        return "warn", "could not query Spamhaus (DNS lookup failed)"
+    if m.group(1) == "NXDOMAIN":
+        return "ok", "not listed on Spamhaus ZEN"
+    res = re.findall(r"\sIN\s+A\s+(\S+)", p.stdout)
+    if not res:
+        return "ok", "not listed on Spamhaus ZEN"
+    if any(x.startswith("127.255.255.") for x in res):
+        return "warn", "Spamhaus refused the query"
+    return "error", f"listed on Spamhaus ZEN ({', '.join(res)}) - see https://check.spamhaus.org/"
+
+
+def port25_out():
+    try:
+        with socket.create_connection(("gmail-smtp-in.l.google.com", 25), timeout=8):
+            return True
+    except OSError:
+        return False
+
+
+def checks(include_dns=True):
+    """Health checks, in the spirit of Mail-in-a-Box's status page."""
+    out = []
+
+    def add(group, name, st, detail=""):
+        out.append({"group": group, "name": name, "status": st, "detail": detail})
+
+    st = status()
+    for s, state in st["services"].items():
+        if s == "clamav-daemon" and state != "active":
+            add("Services", s, "warn", "starts once virus signatures are downloaded")
+        else:
+            add("Services", s, "ok" if state == "active" else "error", state)
+
+    for port, name in ((25, "SMTP"), (465, "SMTPS"), (587, "Submission"), (993, "IMAPS"), (443, "HTTPS")):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=3):
+                add("Network", f"port {port} ({name})", "ok", "listening")
+        except OSError:
+            add("Network", f"port {port} ({name})", "error", "not listening")
+    out25 = port25_out()
+    add("Network", "outgoing port 25", "ok" if out25 else "error",
+        "can reach other mail servers" if out25
+        else "blocked - ask your hosting provider to open outbound port 25")
+    s, d = blocklist_check()
+    add("Network", f"IP {C['SERVER_IPV4']} reputation", s, d)
+
+    cert = st["certificate"]
+    if not cert:
+        add("Security", "TLS certificate", "error", "not found")
+    else:
+        days = cert["days_left"]
+        s = "ok" if days is not None and days > 14 else ("warn" if days and days > 3 else "error")
+        add("Security", "TLS certificate", s, f"{cert['issuer']}, expires in {days} days")
+        if C["MAIL_HOSTNAME"] not in cert["names"]:
+            add("Security", "certificate name", "error", f"does not cover {C['MAIL_HOSTNAME']}")
+        if C["CERT_MODE"] == "selfsigned":
+            add("Security", "certificate type", "warn", "self-signed: mail apps will show warnings")
+    admins = read_admins()
+    add("Security", "dashboard admins", "ok" if admins else "warn",
+        ", ".join(admins) if admins else "none (mailctl admin add <email>)")
+
+    if st["reboot_required"]:
+        add("System", "reboot", "warn", "updates are installed that need a reboot")
+    free_pct = st["disk"]["free"] * 100 / max(st["disk"]["total"], 1)
+    add("System", "disk space", "ok" if free_pct > 10 else ("warn" if free_pct > 5 else "error"),
+        f"{free_pct:.0f}% free ({human_bytes(st['disk']['free'])})")
+    mem = st["memory"]
+    if mem.get("total"):
+        avail = mem["available"] * 100 / mem["total"]
+        add("System", "memory", "ok" if avail > 10 else "warn", f"{avail:.0f}% available")
+    backups = backup_list()
+    if not backups:
+        add("System", "backups", "warn", "no backup yet")
+    else:
+        age = (datetime.datetime.now() - datetime.datetime.fromisoformat(backups[0]["created"])).days
+        add("System", "backups", "ok" if age <= 2 else "warn",
+            f"last backup {backups[0]['created'][:16].replace('T', ' ')}")
+    q = st["counts"]["queue"]
+    add("Mail", "outgoing queue", "ok" if q < 20 else "warn", f"{q} message(s) waiting")
+
+    if include_dns:
+        for d, _ in read_map(VDOMAINS):
+            for r in dns_check(d):
+                add(f"DNS: {d}", f"{r['type']} {r['name']}", r["status"], r["note"] or r["purpose"])
+    return out
+
+
+# ------------------------------------------------------------------ queue, bans, logs
+
+def queue_action(action, qid=None):
+    if action == "flush":
+        run(["postqueue", "-f"])
+        audit("queue flush")
+        info("retrying delivery of all queued mail")
+        return {"action": action}
+    if action not in ("delete", "hold", "release", "requeue"):
+        raise Fail(f"unknown queue action: {action}")
+    if not qid or not (qid == "ALL" or QUEUE_ID_RE.match(qid)):
+        raise Fail("give a queue ID (or ALL)")
+    flag = {"delete": "-d", "hold": "-h", "release": "-H", "requeue": "-r"}[action]
+    run(["postsuper", flag, qid])
+    audit(f"queue {action} {qid}")
+    info(f"queue {action} {qid}")
+    return {"action": action, "id": qid}
+
+
+def bans():
+    p = run(["fail2ban-client", "status"], check=False)
+    m = re.search(r"Jail list:\s*(.*)", p.stdout)
+    jails = [j.strip() for j in m.group(1).split(",") if j.strip()] if m else []
+    out = []
+    for j in jails:
+        s = run(["fail2ban-client", "status", j], check=False).stdout
+        ips = re.search(r"Banned IP list:\s*(.*)", s)
+        failed = re.search(r"Total failed:\s*(\d+)", s)
+        banned = re.search(r"Total banned:\s*(\d+)", s)
+        out.append({"jail": j, "banned": ips.group(1).split() if ips else [],
+                    "total_failed": int(failed.group(1)) if failed else 0,
+                    "total_banned": int(banned.group(1)) if banned else 0})
+    return out
+
+
+def unban(ip):
+    try:
+        ipaddress.ip_address(ip or "")
+    except ValueError:
+        raise Fail(f"invalid IP address: {ip}")
+    run(["fail2ban-client", "unban", ip])
+    audit(f"unban {ip}")
+    info(f"unbanned {ip}")
+    return {"ip": ip}
+
+
+LOG_UNITS = {
+    "mail": ["postfix@-.service", "dovecot.service"],
+    "postfix": ["postfix@-.service"],
+    "dovecot": ["dovecot.service"],
+    "security": ["fail2ban.service"],
+    "web": ["nginx.service", "mail-dashboard.service"],
+}
+
+
+def logs(kind="mail", lines=200, grep=None):
+    lines = max(1, min(int(lines), 5000))
+    fetch = lines * 5 if grep else lines
+    if kind == "spam":
+        out = run(["tail", "-n", str(fetch), "/var/log/rspamd/rspamd.log"], check=False).stdout.splitlines()
+    elif kind == "audit":
+        out = run(["tail", "-n", str(fetch), AUDIT_LOG], check=False).stdout.splitlines()
+    else:
+        units = LOG_UNITS.get(kind)
+        if not units:
+            raise Fail(f"unknown log: {kind} (use: mail, postfix, dovecot, spam, security, web, audit)")
+        cmd = ["journalctl", "--no-pager", "-o", "short-iso", "-n", str(fetch)]
+        for u in units:
+            cmd += ["-u", u]
+        out = run(cmd, check=False).stdout.splitlines()
+    if grep:
+        g = grep.lower()
+        out = [x for x in out if g in x.lower()]
+    return out[-lines:]
+
+
+# ------------------------------------------------------------------ backups
+
+def backup_list():
+    out = []
+    for f in sorted(glob.glob(os.path.join(C["BACKUP_DIR"], "mail-backup-*.tar.gz")), reverse=True):
+        st = os.stat(f)
+        out.append({"file": os.path.basename(f), "size": st.st_size,
+                    "created": datetime.datetime.fromtimestamp(st.st_mtime).isoformat()})
+    return out
+
+
+def backup_run(background=False):
+    audit("backup run")
+    if background:
+        started = shutil.which("systemd-run") and run(
+            ["systemd-run", "--unit", f"mail-backup-{int(time.time())}", "--collect",
+             "/usr/local/sbin/mail-backup"], check=False).returncode == 0
+        if not started:
+            subprocess.Popen(["/usr/local/sbin/mail-backup"], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        info("backup started in the background")
+        return {"started": True}
+    p = run(["/usr/local/sbin/mail-backup"], timeout=86400)
+    info(p.stdout.strip())
+    return {"output": p.stdout.strip()}
+
+
+# ------------------------------------------------------------------ dashboard admins
+
+def read_admins():
+    try:
+        with open(ADMINS_FILE) as f:
+            return [x.strip().lower() for x in f if x.strip() and not x.startswith("#")]
+    except FileNotFoundError:
+        return []
+
+
+def write_admins(admins):
+    text = "# Mailboxes allowed to use the admin dashboard (managed by mailctl)\n"
+    text += "".join(f"{a}\n" for a in dict.fromkeys(admins))
+    write_file(ADMINS_FILE, text, mode=0o640, like=ADMINS_FILE)
+
+
+def admin_add(email):
+    email = lower_email(email)
+    if not find_user(read_users(), email):
+        raise Fail(f"{email} is not a mailbox on this server")
+    admins = read_admins()
+    if email not in admins:
+        write_admins(admins + [email])
+    audit(f"admin add {email}")
+    info(f"{email} can now use the admin dashboard")
+    return {"email": email}
+
+
+def admin_del(email):
+    email = lower_email(email)
+    admins = read_admins()
+    if email not in admins:
+        raise Fail(f"{email} is not an admin")
+    if len(admins) == 1:
+        raise Fail("refusing to remove the last admin")
+    write_admins([a for a in admins if a != email])
+    audit(f"admin del {email}")
+    info(f"{email} is no longer an admin")
+    return {"email": email}
+
+
+# ------------------------------------------------------------------ certificate
+
+def cert_refresh():
+    """Get or extend the certificate: the mail host plus every mta-sts,
+    autoconfig and autodiscover name that already points at this server."""
+    if C["CERT_MODE"] != "letsencrypt":
+        info("self-signed certificate mode: nothing to do")
+        return {"changed": False, "names": (cert_info() or {}).get("names", [])}
+    names = [C["MAIL_HOSTNAME"]]
+    for d, _ in read_map(VDOMAINS):
+        for sub in ("mta-sts", "autoconfig", "autodiscover"):
+            n = f"{sub}.{d}"
+            if C["SERVER_IPV4"] in (dig(n, "A") or []):
+                names.append(n)
+    current = (cert_info() or {}).get("names", [])
+    if set(names) <= set(current):
+        info("certificate already covers: " + ", ".join(current))
+        return {"changed": False, "names": current}
+    cmd = ["certbot", "certonly", "--webroot", "-w", "/var/www/letsencrypt",
+           "--cert-name", C["MAIL_HOSTNAME"], "--non-interactive", "--agree-tos",
+           "--keep-until-expiring", "--expand", "--no-eff-email",
+           "--email", C.get("LETSENCRYPT_EMAIL") or C["ADMIN_EMAIL"]]
+    for n in names:
+        cmd += ["-d", n]
+    run(cmd, timeout=600)
+    run(["systemctl", "reload", "postfix", "dovecot", "nginx"], check=False)
+    audit("cert refresh " + ",".join(names))
+    info("certificate now covers: " + ", ".join(names))
+    return {"changed": True, "names": names}
+
+
+def migrate():
+    """Rewrite the users file for the installed Dovecot version (after upgrades)."""
+    if os.path.exists(USERS_FILE):
+        write_users(read_users())
+    return {}
+
+
+# ------------------------------------------------------------------ output
+
+MARK = {"ok": "✓", "warn": "!", "error": "✗"}
+
+
+def table(rows, cols):
+    if not rows:
+        print("(none)")
+        return
+    widths = [max(len(h), *(len(str(r[i])) for r in rows)) for i, h in enumerate(cols)]
+    print("  ".join(h.upper().ljust(w) for h, w in zip(cols, widths)).rstrip())
+    for r in rows:
+        print("  ".join(str(c).ljust(w) for c, w in zip(r, widths)).rstrip())
+
+
+def print_dns(domain, recs):
+    print(f"DNS records for {domain}")
+    print('(create these at your DNS provider; "@" means the domain itself)\n')
+    table([(r["type"], r["name"], f'"{r["value"]}"' if r["type"] == "TXT" else r["value"])
+           for r in recs], ["type", "name", "value"])
+    print()
+    if domain == C["DOMAIN"]:
+        print("Reverse DNS (set in your hosting provider's control panel, not at your DNS provider):")
+        print(f"  PTR  {C['SERVER_IPV4']}  ->  {C['MAIL_HOSTNAME']}")
+        if C.get("SERVER_IPV6"):
+            print(f"  PTR  {C['SERVER_IPV6']}  ->  {C['MAIL_HOSTNAME']}")
+        print()
+    print("The DKIM value is long. If your DNS provider rejects it, split it into")
+    print("several quoted strings of up to 255 characters; most providers do this for you.")
+
+
+def show_status(s):
+    print("Services")
+    for k, v in s["services"].items():
+        print(f"  {k:<26} {v}")
+    print("\nCertificate")
+    c = s["certificate"]
+    if c:
+        print(f"  names   {', '.join(c['names'])}")
+        print(f"  expires {c['expires'][:10]} ({c['days_left']} days)")
+    else:
+        print("  not found")
+    n = s["counts"]
+    print("\nMail")
+    print(f"  domains:   {n['domains']}")
+    print(f"  mailboxes: {n['mailboxes']}")
+    print(f"  aliases:   {n['aliases']}")
+    print(f"  queue:     {n['queue']} message(s) waiting")
+    print(f"  disk:      {human_bytes(s['disk']['vmail'])} in {VMAIL_DIR}, "
+          f"{human_bytes(s['disk']['free'])} free")
+
+
+def show_checks(rows):
+    group = None
+    for r in rows:
+        if r["group"] != group:
+            group = r["group"]
+            print(f"\n{group}")
+        print(f"  {MARK[r['status']]} {r['name']:<34} {r['detail']}")
+    bad = sum(1 for r in rows if r["status"] == "error")
+    warn = sum(1 for r in rows if r["status"] == "warn")
+    print(f"\n{bad} problem(s), {warn} warning(s)")
+
+
+USAGE = """Usage: mailctl [--json] <command> [arguments]
 
 Mailboxes
-  user add <email>              Create a mailbox (asks for the password)
-  user passwd <email>           Change a mailbox password
-  user del <email> [--purge]    Remove a mailbox (--purge also deletes its mail)
-  user list                     List mailboxes and their disk usage
+  user add <email> [--quota 2G]   Create a mailbox (asks for the password)
+  user passwd <email>             Change a mailbox password
+  user quota <email> <size|none>  Set a storage limit, e.g. 500M or 5G
+  user del <email> [--purge]      Remove a mailbox (--purge also deletes its mail)
+  user list                       List mailboxes with usage and quota
+  user info <email>               Details for one mailbox
 
 Aliases / forwarding
   alias add <alias> <dest>[,<dest>...]
-                                Forward <alias> to one or more addresses.
-                                Use @domain as <alias> for a catch-all.
-  alias del <alias>             Remove an alias
-  alias list                    List aliases
+                                  Forward <alias> to one or more addresses.
+                                  Use @domain as <alias> for a catch-all.
+  alias del <alias>               Remove an alias
+  alias list                      List aliases
 
 Domains
-  domain add <domain>           Host mail for another domain (creates its DKIM key)
-  domain del <domain>           Stop hosting a domain (must have no mailboxes)
-  domain list                   List hosted domains
+  domain add <domain>             Host mail for another domain (creates its DKIM key)
+  domain del <domain>             Stop hosting a domain (must have no mailboxes)
+  domain list                     List hosted domains
 
-Other
-  dns [domain]                  Print the DNS records to create
-  status                        Show service, certificate and queue status
-  backup                        Run a backup now
+Health
+  status                          Services, certificate, counts, disk
+  check                           Full health check (services, DNS, blocklists, ...)
+  dns [domain] [--check]          DNS records to create (--check verifies them live)
 
-Passwords can be piped in for scripting: echo 'secret' | mailctl user add a@b.com
-EOF
-}
+Operations
+  queue [list]                    Outgoing mail waiting to be delivered
+  queue flush                     Retry delivery now
+  queue delete|hold|release <id|ALL>
+  bans                            IPs blocked by fail2ban
+  unban <ip>                      Unblock an IP
+  logs [mail|postfix|dovecot|spam|security|web|audit] [--lines N] [--grep TEXT]
+  backup [--background]           Run a backup now
+  backup list                     List backups
+  cert                            Get/extend the Let's Encrypt certificate
 
-# ---------------------------------------------------------------- helpers
+Admin dashboard (https://<mail hostname>/admin/)
+  admin add <email>               Allow a mailbox to use the admin dashboard
+  admin del <email>               Remove that permission
+  admin list                      List dashboard admins
 
-lower() { tr '[:upper:]' '[:lower:]' <<<"$1"; }
+Add --json to any command for machine-readable output.
+Passwords can be piped in for scripting: echo 'secret' | mailctl user add a@b.com"""
 
-valid_email() {
-  [[ $1 =~ ^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$ ]]
-}
 
-valid_domain() {
-  [[ $1 =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]
-}
+def emit(data, human=None):
+    if JSON:
+        print(json.dumps(data, default=str))
+    elif human:
+        human(data)
 
-domain_of() { echo "${1#*@}"; }
 
-# key_in_file <key> <file>: true if the first column of a line equals key.
-key_in_file() {
-  [[ -f $2 ]] && awk -v k="$1" '$1 == k { found = 1 } END { exit !found }' "$2"
-}
+def main(argv):
+    global JSON, ACTOR, C
+    args = list(argv)
+    if "--json" in args:
+        JSON = True
+        args.remove("--json")
+    if "--actor" in args:
+        i = args.index("--actor")
+        ACTOR = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
 
-# remove_key <key> <file>: delete lines whose first column equals key.
-remove_key() {
-  local tmp
-  tmp=$(mktemp "$2.XXXXXX")
-  awk -v k="$1" '$1 != k' "$2" >"$tmp"
-  chmod --reference="$2" "$tmp"
-  chown --reference="$2" "$tmp"
-  mv "$tmp" "$2"
-}
+    def opt(name, default=None):
+        if name in args:
+            i = args.index(name)
+            val = args[i + 1] if i + 1 < len(args) else None
+            del args[i:i + 2]
+            return val
+        return default
 
-# commit_users_file <tmp>: atomically replace the Dovecot users file.
-# Dovecot re-reads the file when its size or modification time (in whole
-# seconds) changes. A password change keeps the size, so make sure the
-# modification time always moves forward, even for two edits in one second.
-commit_users_file() {
-  local tmp=$1 old
-  old=$(stat -c %Y "$USERS_FILE")
-  chmod --reference="$USERS_FILE" "$tmp"
-  chown --reference="$USERS_FILE" "$tmp"
-  mv "$tmp" "$USERS_FILE"
-  if (( $(stat -c %Y "$USERS_FILE") <= old )); then
-    touch -d "@$((old + 1))" "$USERS_FILE"
-  fi
-}
+    def flag(name):
+        if name in args:
+            args.remove(name)
+            return True
+        return False
 
-user_exists() {
-  [[ -f $USERS_FILE ]] && awk -F: -v k="$1" '$1 == k { found = 1 } END { exit !found }' "$USERS_FILE"
-}
+    if not args or args[0] in ("help", "-h", "--help"):
+        print(USAGE)
+        return 0
+    if os.geteuid() != 0:
+        raise Fail("must be run as root (use sudo)")
+    C = load_conf()
 
-domain_exists() { key_in_file "$1" "$VDOMAINS"; }
+    # Python file descriptors are not inherited by child processes, so the
+    # lock is never held by a service that mailctl happens to (re)start.
+    lock = open(LOCK_FILE, "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
 
-read_password() {
-  local pw pw2
-  if [[ -t 0 ]]; then
-    read -rsp "Password for $1: " pw; echo >&2
-    read -rsp "Repeat password: " pw2; echo >&2
-    [[ $pw == "$pw2" ]] || die "passwords do not match"
-  else
-    IFS= read -r pw || true
-  fi
-  [[ ${#pw} -ge 10 ]] || die "password must be at least 10 characters"
-  [[ $pw != *:* ]] || die "password must not contain ':'"
-  printf '%s' "$pw"
-}
+    cmd = args[0]
+    sub = args[1] if len(args) > 1 else ""
+    a = args[2:]
+    arg = a[0] if a else ""
 
-hash_password() {
-  # SHA512-CRYPT; the password is passed on stdin so it never shows in ps.
-  printf '%s\n' "$1" | openssl passwd -6 -stdin | sed 's/^/{SHA512-CRYPT}/'
-}
+    if cmd == "user":
+        if sub == "add":
+            quota = opt("--quota")
+            a = args[2:]
+            emit(user_add(a[0] if a else "", quota))
+        elif sub == "passwd":
+            emit(user_passwd(arg))
+        elif sub == "quota":
+            if len(a) < 2:
+                raise Fail("usage: mailctl user quota <email> <size|none>")
+            emit(user_quota(a[0], a[1]))
+        elif sub == "del":
+            purge = flag("--purge")
+            a = args[2:]
+            emit(user_del(a[0] if a else "", purge))
+        elif sub == "list":
+            emit(user_list(), lambda d: table(
+                [(u["email"], human_bytes(u["used_bytes"]), u["quota"] or "unlimited",
+                  "-" if u["messages"] is None else u["messages"],
+                  "admin" if u["admin"] else "") for u in d],
+                ["mailbox", "used", "quota", "messages", ""]))
+        elif sub == "info":
+            emit(user_info(arg), lambda u: print(json.dumps(u, indent=2)))
+        else:
+            print(USAGE)
+            return 1
+    elif cmd == "alias":
+        if sub == "add":
+            emit(alias_add(arg, a[1] if len(a) > 1 else ""))
+        elif sub == "del":
+            emit(alias_del(arg))
+        elif sub == "list":
+            emit(alias_list(), lambda d: table(
+                [(x["alias"], "-> " + ",".join(x["destinations"])) for x in d],
+                ["alias", "destinations"]))
+        else:
+            print(USAGE)
+            return 1
+    elif cmd == "domain":
+        if sub == "add":
+            emit(domain_add(arg), lambda d: (print(), print_dns(d["domain"], d["records"])))
+        elif sub == "del":
+            emit(domain_del(arg))
+        elif sub == "list":
+            emit(domain_list(), lambda d: table(
+                [(x["domain"], x["mailboxes"], x["aliases"], "primary" if x["primary"] else "")
+                 for x in d], ["domain", "mailboxes", "aliases", ""]))
+        else:
+            print(USAGE)
+            return 1
+    elif cmd == "dns":
+        check = flag("--check")
+        dom = (args[1] if len(args) > 1 else C["DOMAIN"]).lower()
+        if check:
+            emit(dns_check(dom), lambda d: table(
+                [(MARK[r["status"]], r["type"], r["name"], r["note"] or "ok") for r in d],
+                ["", "type", "name", "result"]))
+        else:
+            emit(dns_records(dom), lambda d: print_dns(dom, d))
+    elif cmd == "status":
+        emit(status(), show_status)
+    elif cmd == "check":
+        emit(checks(include_dns=not flag("--no-dns")), show_checks)
+    elif cmd == "queue":
+        if sub in ("", "list"):
+            emit(queue_list(), lambda d: table(
+                [(q["id"], q["queue"], q["arrival"][:16], q["sender"] or "<>",
+                  ",".join(r["address"] for r in q["recipients"]),
+                  q["recipients"][0]["reason"][:60] if q["recipients"] else "") for q in d],
+                ["id", "queue", "arrived", "from", "to", "reason"]))
+        else:
+            emit(queue_action(sub, arg or None))
+    elif cmd == "bans":
+        emit(bans(), lambda d: table(
+            [(b["jail"], b["total_failed"], " ".join(b["banned"]) or "-") for b in d],
+            ["jail", "failed", "banned ips"]))
+    elif cmd == "unban":
+        emit(unban(sub))
+    elif cmd == "logs":
+        lines = opt("--lines", 200)
+        grep = opt("--grep")
+        kind = args[1] if len(args) > 1 else "mail"
+        emit(logs(kind, lines, grep), lambda d: print("\n".join(d)))
+    elif cmd == "backup":
+        if sub == "list":
+            emit(backup_list(), lambda d: table(
+                [(b["file"], human_bytes(b["size"]), b["created"][:16].replace("T", " ")) for b in d],
+                ["file", "size", "created"]))
+        elif sub in ("", "run", "--background"):
+            bg = sub == "--background" or flag("--background")
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            emit(backup_run(bg))
+        else:
+            print(USAGE)
+            return 1
+    elif cmd == "admin":
+        if sub == "add":
+            emit(admin_add(arg))
+        elif sub == "del":
+            emit(admin_del(arg))
+        elif sub == "list":
+            emit(read_admins(), lambda d: print("\n".join(d) or "(none)"))
+        else:
+            print(USAGE)
+            return 1
+    elif cmd == "cert":
+        emit(cert_refresh())
+    elif cmd == "migrate":
+        emit(migrate())
+    else:
+        print(USAGE)
+        return 1
+    return 0
 
-# Rebuild the map that says which login may use which From: address.
-# A user may send as their own address and as any alias that delivers to them.
-rebuild_sender_login() {
-  local tmp
-  tmp=$(mktemp "$SENDER_LOGIN.XXXXXX")
-  {
-    awk '{ print $1, $1 }' "$VMAILBOX"
-    awk '{ print $1, $2 }' "$VALIASES"
-  } | awk '
-      {
-        k = $1
-        if (k in owners) owners[k] = owners[k] "," $2
-        else owners[k] = $2
-      }
-      END { for (a in owners) print a, owners[a] }' | sort >"$tmp"
-  chmod 644 "$tmp"
-  mv "$tmp" "$SENDER_LOGIN"
-}
 
-postmap_all() {
-  rebuild_sender_login
-  local f
-  for f in "$VDOMAINS" "$VMAILBOX" "$VALIASES" "$SENDER_LOGIN"; do
-    postmap "hash:$f"
-  done
-}
-
-# ---------------------------------------------------------------- users
-
-user_add() {
-  local email pw
-  email=$(lower "${1:-}")
-  valid_email "$email" || die "invalid email address: ${1:-<none>}"
-  domain_exists "$(domain_of "$email")" || die "domain $(domain_of "$email") is not hosted here (mailctl domain add ...)"
-  user_exists "$email" && die "$email already exists"
-  key_in_file "$email" "$VALIASES" && die "$email is already an alias"
-
-  pw=$(read_password "$email")
-  local tmp
-  tmp=$(mktemp "$USERS_FILE.XXXXXX")
-  cat "$USERS_FILE" >"$tmp"
-  echo "$email:$(hash_password "$pw")::::::" >>"$tmp"
-  commit_users_file "$tmp"
-  echo "$email OK" >>"$VMAILBOX"
-  postmap_all
-
-  # Create the mailbox right away so the default folders exist.
-  doveadm mailbox list -u "$email" >/dev/null 2>&1 || true
-  info "created mailbox $email"
-}
-
-user_passwd() {
-  local email pw hash tmp
-  email=$(lower "${1:-}")
-  user_exists "$email" || die "no such mailbox: ${1:-<none>}"
-  pw=$(read_password "$email")
-  hash=$(hash_password "$pw")
-  tmp=$(mktemp "$USERS_FILE.XXXXXX")
-  awk -F: -v OFS=: -v k="$email" -v h="$hash" '$1 == k { $2 = h } { print }' "$USERS_FILE" >"$tmp"
-  commit_users_file "$tmp"
-  info "password changed for $email"
-}
-
-user_del() {
-  local email purge=no tmp
-  email=$(lower "${1:-}")
-  [[ ${2:-} == --purge ]] && purge=yes
-  user_exists "$email" || die "no such mailbox: ${1:-<none>}"
-
-  tmp=$(mktemp "$USERS_FILE.XXXXXX")
-  awk -F: -v k="$email" '$1 != k' "$USERS_FILE" >"$tmp"
-  commit_users_file "$tmp"
-  remove_key "$email" "$VMAILBOX"
-  postmap_all
-  doveadm auth cache flush >/dev/null 2>&1 || true
-  doveadm kick "$email" >/dev/null 2>&1 || true
-
-  local dir
-  dir="$VMAIL_DIR/$(domain_of "$email")/${email%@*}"
-  if [[ $purge == yes ]]; then
-    rm -rf -- "$dir"
-    info "removed mailbox $email and deleted its mail"
-  else
-    info "removed mailbox $email (mail kept in $dir; use --purge to delete)"
-  fi
-}
-
-user_list() {
-  [[ -s $USERS_FILE ]] || { echo "(no mailboxes)"; return; }
-  printf '%-45s %s\n' "MAILBOX" "SIZE"
-  local email dir size
-  while IFS=: read -r email _; do
-    [[ -n $email ]] || continue
-    dir="$VMAIL_DIR/$(domain_of "$email")/${email%@*}"
-    size=$(du -sh "$dir" 2>/dev/null | cut -f1)
-    printf '%-45s %s\n' "$email" "${size:-0}"
-  done <"$USERS_FILE"
-}
-
-# ---------------------------------------------------------------- aliases
-
-alias_add() {
-  local alias dests d
-  alias=$(lower "${1:-}")
-  dests=$(lower "${2:-}")
-  dests=${dests// /}
-  [[ -n $alias && -n $dests ]] || die "usage: mailctl alias add <alias> <dest>[,<dest>...]"
-
-  if [[ $alias == @* ]]; then
-    valid_domain "${alias#@}" || die "invalid catch-all: $alias"
-  else
-    valid_email "$alias" || die "invalid alias address: $alias"
-  fi
-  domain_exists "$(domain_of "$alias")" || die "domain $(domain_of "$alias") is not hosted here"
-  user_exists "$alias" && die "$alias is a mailbox; delete it first or pick another address"
-  key_in_file "$alias" "$VALIASES" && die "alias $alias already exists (delete it first to change it)"
-
-  IFS=, read -ra list <<<"$dests"
-  for d in "${list[@]}"; do
-    valid_email "$d" || die "invalid destination address: $d"
-  done
-
-  echo "$alias $dests" >>"$VALIASES"
-  postmap_all
-  info "alias $alias -> $dests"
-}
-
-alias_del() {
-  local alias
-  alias=$(lower "${1:-}")
-  key_in_file "$alias" "$VALIASES" || die "no such alias: ${1:-<none>}"
-  remove_key "$alias" "$VALIASES"
-  postmap_all
-  info "removed alias $alias"
-}
-
-alias_list() {
-  [[ -s $VALIASES ]] || { echo "(no aliases)"; return; }
-  awk '{ printf "%-40s -> %s\n", $1, $2 }' "$VALIASES"
-}
-
-# ---------------------------------------------------------------- domains
-
-domain_add() {
-  local domain key
-  domain=$(lower "${1:-}")
-  valid_domain "$domain" || die "invalid domain: ${1:-<none>}"
-  domain_exists "$domain" && die "$domain is already hosted here"
-
-  key="$DKIM_DIR/$domain.$DKIM_SELECTOR.key"
-  install -d -o _rspamd -g _rspamd -m 750 "$DKIM_DIR"
-  if [[ ! -f $key ]]; then
-    rspamadm dkim_keygen -b 2048 -s "$DKIM_SELECTOR" -d "$domain" -k "$key" >/dev/null
-    chown _rspamd:_rspamd "$key"
-    chmod 640 "$key"
-  fi
-
-  echo "$domain OK" >>"$VDOMAINS"
-  install -d -o vmail -g vmail -m 750 "$VMAIL_DIR/$domain"
-  # Rspamd reads the key file when it signs, so no reload is needed.
-  postmap_all
-
-  # Standard role addresses (RFC 2142) go to the administrator.
-  local role
-  for role in postmaster abuse; do
-    if ! user_exists "$role@$domain" && ! key_in_file "$role@$domain" "$VALIASES"; then
-      echo "$role@$domain $ADMIN_EMAIL" >>"$VALIASES"
-    fi
-  done
-  postmap_all
-
-  info "now hosting $domain"
-  echo
-  dns_records "$domain"
-}
-
-domain_del() {
-  local domain
-  domain=$(lower "${1:-}")
-  domain_exists "$domain" || die "no such domain: ${1:-<none>}"
-  [[ $domain == "$DOMAIN" ]] && die "refusing to remove the primary domain $DOMAIN"
-  if awk -F: -v d="@$domain" 'substr($1, length($1) - length(d) + 1) == d { f = 1 } END { exit !f }' "$USERS_FILE"; then
-    die "$domain still has mailboxes; delete them first (mailctl user list)"
-  fi
-
-  remove_key "$domain" "$VDOMAINS"
-  local tmp
-  tmp=$(mktemp "$VALIASES.XXXXXX")
-  awk -v d="@$domain" 'substr($1, length($1) - length(d) + 1) != d' "$VALIASES" >"$tmp"
-  chmod 644 "$tmp"
-  mv "$tmp" "$VALIASES"
-  postmap_all
-  info "stopped hosting $domain (DKIM key kept in $DKIM_DIR)"
-}
-
-domain_list() {
-  [[ -s $VDOMAINS ]] || { echo "(no domains)"; return; }
-  awk '{ print $1 }' "$VDOMAINS"
-}
-
-# ---------------------------------------------------------------- DNS
-
-dns_records() {
-  local domain=${1:-$DOMAIN} key pub
-  domain=$(lower "$domain")
-  domain_exists "$domain" || die "$domain is not hosted here"
-  key="$DKIM_DIR/$domain.$DKIM_SELECTOR.key"
-  [[ -f $key ]] || die "no DKIM key for $domain ($key)"
-  pub=$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | base64 -w0)
-
-  cat <<EOF
-DNS records for $domain
-(create these at your DNS provider; "@" means the domain itself)
-
-TYPE  NAME                               VALUE
-EOF
-  if [[ $domain == "$DOMAIN" ]]; then
-    printf '%-5s %-34s %s\n' A "$MAIL_HOSTNAME." "$SERVER_IPV4"
-    [[ -n ${SERVER_IPV6:-} ]] && printf '%-5s %-34s %s\n' AAAA "$MAIL_HOSTNAME." "$SERVER_IPV6"
-  fi
-  printf '%-5s %-34s %s\n' MX "@" "10 $MAIL_HOSTNAME."
-  printf '%-5s %-34s %s\n' TXT "@" "\"v=spf1 mx -all\""
-  printf '%-5s %-34s %s\n' TXT "$DKIM_SELECTOR._domainkey" "\"v=DKIM1; k=rsa; p=$pub\""
-  printf '%-5s %-34s %s\n' TXT "_dmarc" "\"v=DMARC1; p=quarantine; rua=mailto:postmaster@$domain; adkim=r; aspf=r\""
-  printf '%-5s %-34s %s\n' SRV "_imaps._tcp" "0 1 993 $MAIL_HOSTNAME."
-  printf '%-5s %-34s %s\n' SRV "_submissions._tcp" "0 1 465 $MAIL_HOSTNAME."
-  printf '%-5s %-34s %s\n' SRV "_submission._tcp" "0 1 587 $MAIL_HOSTNAME."
-  printf '%-5s %-34s %s\n' CNAME "autoconfig" "$MAIL_HOSTNAME."
-  echo
-  if [[ $domain == "$DOMAIN" ]]; then
-    echo "Reverse DNS (set in your hosting provider's control panel, not at your DNS provider):"
-    echo "  PTR  $SERVER_IPV4  ->  $MAIL_HOSTNAME"
-    [[ -n ${SERVER_IPV6:-} ]] && echo "  PTR  $SERVER_IPV6  ->  $MAIL_HOSTNAME"
-    echo
-  fi
-  echo "The DKIM value is long. If your DNS provider rejects it, split it into"
-  echo "several quoted strings of up to 255 characters; most providers do this for you."
-}
-
-# ---------------------------------------------------------------- status
-
-status() {
-  local svc state
-  echo "Services"
-  for svc in postfix dovecot rspamd redis-server unbound nginx fail2ban \
-             clamav-daemon clamav-freshclam; do
-    systemctl cat "$svc.service" >/dev/null 2>&1 || continue
-    state=$(systemctl is-active "$svc" 2>/dev/null || true)
-    printf '  %-18s %s\n' "$svc" "$state"
-  done
-  local fpm
-  fpm=$(systemctl list-units --type=service --all --no-legend 'php*-fpm.service' 2>/dev/null | awk 'NR == 1 { print $1 }')
-  [[ -n $fpm ]] && printf '  %-18s %s\n' "${fpm%.service}" "$(systemctl is-active "$fpm" || true)"
-
-  echo
-  echo "Certificate"
-  local cert
-  cert=$(postconf -h smtpd_tls_chain_files 2>/dev/null | awk -F', *' '{ print $2 }')
-  if [[ -n $cert && -r $cert ]]; then
-    echo "  $(openssl x509 -in "$cert" -noout -subject | sed 's/subject=//')"
-    echo "  expires $(openssl x509 -in "$cert" -noout -enddate | cut -d= -f2)"
-  else
-    echo "  not found"
-  fi
-
-  echo
-  echo "Mail"
-  echo "  domains:   $(grep -c . "$VDOMAINS" 2>/dev/null || echo 0)"
-  echo "  mailboxes: $(grep -c . "$USERS_FILE" 2>/dev/null || echo 0)"
-  echo "  aliases:   $(grep -c . "$VALIASES" 2>/dev/null || echo 0)"
-  echo "  queue:     $(postqueue -j 2>/dev/null | grep -c . || true) message(s) waiting"
-  echo "  disk:      $(du -sh "$VMAIL_DIR" 2>/dev/null | cut -f1) in $VMAIL_DIR"
-}
-
-# ---------------------------------------------------------------- main
-
-cmd=${1:-help}
-sub=${2:-}
-case "$cmd" in
-  user)
-    case "$sub" in
-      add)    user_add "${3:-}" ;;
-      passwd) user_passwd "${3:-}" ;;
-      del)    user_del "${3:-}" "${4:-}" ;;
-      list)   user_list ;;
-      *)      usage; exit 1 ;;
-    esac ;;
-  alias)
-    case "$sub" in
-      add)  alias_add "${3:-}" "${4:-}" ;;
-      del)  alias_del "${3:-}" ;;
-      list) alias_list ;;
-      *)    usage; exit 1 ;;
-    esac ;;
-  domain)
-    case "$sub" in
-      add)  domain_add "${3:-}" ;;
-      del)  domain_del "${3:-}" ;;
-      list) domain_list ;;
-      *)    usage; exit 1 ;;
-    esac ;;
-  dns)    dns_records "${2:-$DOMAIN}" ;;
-  status) status ;;
-  backup) flock -u 9; exec /usr/local/sbin/mail-backup ;;
-  help|-h|--help) usage ;;
-  *) usage; exit 1 ;;
-esac
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Fail as e:
+        if JSON:
+            print(json.dumps({"error": str(e)}))
+        else:
+            print(f"mailctl: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

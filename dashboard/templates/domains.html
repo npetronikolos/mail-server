@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Domains{% endblock %}
+{% block main %}
+<header class="head"><div><h1>Domains &amp; DNS</h1><p class="muted">Every domain this server receives mail for.</p></div></header>
+<section class="card">
+  <table>
+    <thead><tr><th>Domain</th><th>Mailboxes</th><th>Aliases</th><th></th></tr></thead>
+    <tbody>
+    {% for d in domains %}
+      <tr>
+        <td><a href="{{ url_for('domain_view', domain=d.domain) }}"><strong>{{ d.domain }}</strong></a> {% if d.primary %}<span class="badge">primary</span>{% endif %}</td>
+        <td>{{ d.mailboxes }}</td><td>{{ d.aliases }}</td>
+        <td class="actions">
+          <a class="btn small" href="{{ url_for('domain_view', domain=d.domain) }}">DNS records</a>
+          {% if not d.primary %}
+          <form method="post" action="{{ url_for('domain_del', domain=d.domain) }}" class="inline" data-confirm="Stop hosting {{ d.domain }}? Its aliases are removed too.">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <button class="btn small danger" {{ 'disabled title="Delete its mailboxes first"'|safe if d.mailboxes }}>Remove</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+<section class="card">
+  <h2>Add a domain</h2>
+  <form method="post" action="{{ url_for('domain_add') }}" class="row">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input name="domain" placeholder="example.org" required pattern="[A-Za-z0-9.-]+\.[A-Za-z]{2,}">
+    <button class="btn primary">Add domain</button>
+  </form>
+  <p class="muted small">A DKIM key is created and postmaster@ / abuse@ are forwarded to the administrator. Then create the DNS records shown on the domain's page.</p>
+</section>
+{% endblock %}

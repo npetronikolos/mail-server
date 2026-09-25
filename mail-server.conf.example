@@ -40,17 +40,35 @@ LETSENCRYPT_EMAIL="you@gmail.com"
 #   selfsigned  - for lab/testing only; mail clients will show warnings
 CERT_MODE="letsencrypt"
 
-# Also get certificates for autoconfig.DOMAIN (automatic setup for
-# Thunderbird and others). Only set to "yes" after creating the DNS record
-# "autoconfig.DOMAIN CNAME MAIL_HOSTNAME", otherwise the certificate fails.
-ENABLE_AUTOCONFIG_SUBDOMAIN="no"
-
 # Virus scanning with ClamAV. Needs about 1.5 GB of extra RAM; turn off on
 # servers with less than 3 GB of memory.
 ENABLE_CLAMAV="yes"
 
 # Roundcube webmail at https://MAIL_HOSTNAME/
 ENABLE_WEBMAIL="yes"
+
+# Admin dashboard at https://MAIL_HOSTNAME/admin/ (sign in with an admin
+# mailbox; ADMIN_EMAIL is the first admin). Everyone else who signs in gets a
+# personal page: change password, 2FA, device setup.
+ENABLE_DASHBOARD="yes"
+
+# Only allow the dashboard from these IP addresses or networks (space
+# separated, e.g. "203.0.113.7 198.51.100.0/24"). Empty = from anywhere
+# (sign-in still required; turn on two-factor sign-in).
+ADMIN_ALLOWED_IPS=""
+
+# Calendars and contacts (CalDAV/CardDAV) at https://MAIL_HOSTNAME/dav/,
+# signed in with the email address and password. Needs the dashboard.
+ENABLE_DAV="yes"
+
+# MTA-STS tells other mail servers (Gmail, Outlook...) to only ever send to
+# you over an encrypted connection. Modes: enforce, testing, none.
+ENABLE_MTA_STS="yes"
+MTA_STS_MODE="enforce"
+
+# Storage limit for new mailboxes, e.g. "5G" or "500M". Empty = unlimited.
+# Change it per mailbox later with the dashboard or "mailctl user quota".
+DEFAULT_QUOTA=""
 
 # Configure the UFW firewall (opens SSH + mail + web ports, blocks the rest).
 ENABLE_FIREWALL="yes"
@@ -70,3 +88,8 @@ TIMEZONE="UTC"
 # Nightly backups.
 BACKUP_DIR="/var/backups/mail-server"
 BACKUP_KEEP_DAYS="14"
+
+# Also copy every backup to another machine over SSH, e.g.
+# "backup@nas.example.com:/backups/mail". root's SSH key must be allowed to
+# log in there (ssh-keygen, then ssh-copy-id). Empty = keep backups local.
+BACKUP_RSYNC_TARGET=""

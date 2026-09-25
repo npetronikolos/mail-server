@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}My account{% endblock %}
+{% block main %}
+<header class="head"><div><h1>My account</h1><p class="muted">{{ info.email }}</p></div></header>
+
+<div class="grid two">
+  <section class="card">
+    <h2>Mailbox</h2>
+    {% if info.quota_bytes %}
+      <p class="meterrow"><span>Storage</span><meter min="0" max="{{ info.quota_bytes }}" low="{{ info.quota_bytes * 0.8 }}" high="{{ info.quota_bytes * 0.95 }}" optimum="0" value="{{ info.used_bytes }}"></meter><em>{{ human(info.used_bytes) }} of {{ info.quota }}</em></p>
+    {% elif info.used_bytes is defined %}
+      <p>Using <strong>{{ human(info.used_bytes) }}</strong> (no limit)</p>
+    {% endif %}
+    {% if info.messages is not none and info.messages is defined %}<p>{{ info.messages }} messages</p>{% endif %}
+    {% if info.aliases %}<p>Also receives mail for: {{ info.aliases|join(', ') }}</p>{% endif %}
+    {% if conf.ENABLE_WEBMAIL == 'yes' %}<p><a class="btn" href="/" target="_blank" rel="noopener">Open webmail</a></p>{% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Change password</h2>
+    <form method="post" action="{{ url_for('account_password') }}" class="formgrid">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label>Current password<input type="password" name="current" autocomplete="current-password" required></label>
+      <label>New password <small class="muted">(at least 10 characters)</small><input type="password" name="new" minlength="10" autocomplete="new-password" required></label>
+      <label>Repeat new password<input type="password" name="repeat" minlength="10" autocomplete="new-password" required></label>
+      <button class="btn primary">Change password</button>
+    </form>
+  </section>
+</div>
+
+<section class="card">
+  <h2>Set up your devices</h2>
+  <div class="grid three">
+    <div>
+      <h3>iPhone, iPad, Mac</h3>
+      <p>Download the profile and open it; it sets up mail{{ ', calendar and contacts' if dav }} in one step.</p>
+      <a class="btn" href="{{ url_for('apple_profile') }}">Download profile</a>
+    </div>
+    <div>
+      <h3>Other mail apps</h3>
+      <dl class="kv">
+        <dt>Username</dt><dd><code class="copy">{{ info.email }}</code></dd>
+        <dt>Incoming (IMAP)</dt><dd><code class="copy">{{ conf.MAIL_HOSTNAME }}</code> port 993, SSL/TLS</dd>
+        <dt>Outgoing (SMTP)</dt><dd><code class="copy">{{ conf.MAIL_HOSTNAME }}</code> port 465, SSL/TLS</dd>
+      </dl>
+    </div>
+    {% if dav %}
+    <div>
+      <h3>Calendar &amp; contacts</h3>
+      <p>For Thunderbird, DAVx⁵ (Android), GNOME, macOS…</p>
+      <dl class="kv">
+        <dt>Server</dt><dd><code class="copy">https://{{ conf.MAIL_HOSTNAME }}/dav/</code></dd>
+        <dt>Username</dt><dd>your email address and password</dd>
+      </dl>
+      <p><a href="/dav/.web/" target="_blank" rel="noopener">Manage calendars and address books ↗</a></p>
+    </div>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>Two-factor sign-in</h2>
+  {% if has_totp %}
+    <p><span class="badge ok">On</span> Signing in to this dashboard needs a code from your authenticator app.</p>
+    <form method="post" action="{{ url_for('account_2fa_disable') }}" class="row">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input name="code" inputmode="numeric" placeholder="Current 6-digit code" maxlength="7" required>
+      <button class="btn danger">Turn off</button>
+    </form>
+  {% else %}
+    <p>Protect this dashboard with a code from an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password, Bitwarden…).</p>
+    <a class="btn primary" href="{{ url_for('account_2fa') }}">Turn on two-factor sign-in</a>
+  {% endif %}
+  <p class="muted small">This protects the dashboard. Mail apps and webmail keep using your normal password.</p>
+</section>
+{% endblock %}

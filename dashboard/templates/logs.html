@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Logs{% endblock %}
+{% block main %}
+<header class="head"><div><h1>Logs</h1></div></header>
+<form method="get" class="card row wrap">
+  <select name="kind" aria-label="Log">{% for k, label in kinds %}<option value="{{ k }}" {{ 'selected' if k == kind }}>{{ label }}</option>{% endfor %}</select>
+  <input type="search" name="q" value="{{ q }}" placeholder="Filter, e.g. an address or queue ID">
+  <select name="lines" aria-label="Lines">{% for x in (100, 200, 500, 1000, 2000) %}<option {{ 'selected' if x == n }}>{{ x }}</option>{% endfor %}</select>
+  <button class="btn">Show</button>
+</form>
+<section class="card">
+  <pre class="log">{% for l in lines %}{{ l }}
+{% else %}Nothing found.{% endfor %}</pre>
+</section>
+{% endblock %}

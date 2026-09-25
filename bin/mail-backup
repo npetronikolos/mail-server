@@ -25,6 +25,8 @@ paths=(
   /etc/letsencrypt
   /etc/roundcube
   /var/lib/dbconfig-common/sqlite3/roundcube
+  /var/lib/radicale
+  /var/lib/mail-dashboard
   /var/vmail
 )
 existing=()
@@ -48,3 +50,14 @@ fi
 find "$BACKUP_DIR" -maxdepth 1 -name 'mail-backup-*.tar.gz' -mtime +"$BACKUP_KEEP_DAYS" -delete
 
 echo "backup written: $out ($(du -h "$out" | cut -f1))"
+
+# Optional off-site copy: mirror the backup folder to another machine.
+if [[ -n ${BACKUP_RSYNC_TARGET:-} ]]; then
+  if rsync -a --delete -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
+      "$BACKUP_DIR/" "$BACKUP_RSYNC_TARGET/"; then
+    echo "copied to $BACKUP_RSYNC_TARGET"
+  else
+    echo "mail-backup: copying to $BACKUP_RSYNC_TARGET failed" >&2
+    exit 2
+  fi
+fi

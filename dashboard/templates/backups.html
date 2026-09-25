@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Backups{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>Backups</h1><p class="muted">Nightly at 03:30 · all mail, settings, DKIM keys and certificates · kept {{ conf.BACKUP_KEEP_DAYS or 14 }} days</p></div>
+  <form method="post" action="{{ url_for('backup_run') }}" class="inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary">Back up now</button>
+  </form>
+</header>
+<section class="card">
+  <table>
+    <thead><tr><th>Backup</th><th>Size</th><th>Created</th></tr></thead>
+    <tbody>
+    {% for b in backups %}
+      <tr><td><code>{{ b.file }}</code></td><td>{{ human(b.size) }}</td><td>{{ b.created[:16]|replace('T', ' ') }} <small class="muted">({{ ago(b.created) }})</small></td></tr>
+    {% else %}
+      <tr><td colspan="3" class="muted">No backups yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+<section class="card">
+  <h2>Keep a copy somewhere else</h2>
+  {% if conf.BACKUP_RSYNC_TARGET %}
+  <p>Each backup is copied to <code>{{ conf.BACKUP_RSYNC_TARGET }}</code>.</p>
+  {% else %}
+  <p>Backups are stored on this server in <code>{{ conf.BACKUP_DIR or '/var/backups/mail-server' }}</code>. Copy them off regularly, for example from your own computer:</p>
+  <pre class="code copy">rsync -av root@{{ conf.MAIL_HOSTNAME }}:{{ conf.BACKUP_DIR or '/var/backups/mail-server' }}/ ./mail-backups/</pre>
+  <p class="muted small">Or set <code>BACKUP_RSYNC_TARGET</code> in mail-server.conf to copy them automatically after every backup.</p>
+  {% endif %}
+</section>
+{% endblock %}

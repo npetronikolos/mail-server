@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Aliases{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>Aliases &amp; forwarding</h1><p class="muted">Extra addresses that deliver to one or more mailboxes, or to outside addresses.</p></div>
+  <input type="search" class="filter" data-filter="#als" placeholder="Search…" aria-label="Search aliases">
+</header>
+<details class="card add">
+  <summary><span class="btn primary">+ New alias</span></summary>
+  <form method="post" action="{{ url_for('alias_add') }}" class="formgrid">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Address <small class="muted">(leave empty or * for a catch-all)</small>
+      <span class="joined"><input name="local" placeholder="info" pattern="[A-Za-z0-9._%+*-]*"><select name="domain">{% for d in domains %}<option>{{ d.domain }}</option>{% endfor %}</select></span>
+    </label>
+    <label>Deliver to <small class="muted">(one or more addresses, comma separated)</small>
+      <input name="destinations" placeholder="anna@example.com, bob@gmail.com" required>
+    </label>
+    <button class="btn primary">Create alias</button>
+  </form>
+</details>
+<section class="card">
+  <table id="als">
+    <thead><tr><th>Alias</th><th>Delivers to</th><th></th></tr></thead>
+    <tbody>
+    {% for a in aliases %}
+      <tr>
+        <td><strong>{{ a.alias }}</strong>{% if a.alias.startswith('@') %} <span class="badge warn">catch-all</span>{% endif %}</td>
+        <td>{{ a.destinations|join(', ') }}</td>
+        <td class="actions">
+          <form method="post" action="{{ url_for('alias_delete') }}" class="inline" data-confirm="Delete alias {{ a.alias }}?">
+            <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="alias" value="{{ a.alias }}">
+            <button class="btn small danger">Delete</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="3" class="muted">No aliases yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted small">Users can send mail as any alias that delivers to them. The owner of a catch-all can send as any address in that domain.</p>
+</section>
+{% endblock %}
