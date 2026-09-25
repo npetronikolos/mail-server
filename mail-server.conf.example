@@ -66,6 +66,13 @@ ENABLE_DAV="yes"
 ENABLE_MTA_STS="yes"
 MTA_STS_MODE="enforce"
 
+# DANE for outgoing mail: when a receiving domain publishes TLSA records in
+# signed DNS, mail to it only goes out over encryption verified against them.
+# This makes the local Unbound resolver (which checks DNSSEC) the whole
+# server's DNS resolver. Set to "no" if this server must use your hosting
+# provider's resolver (e.g. for private DNS names).
+ENABLE_DANE="yes"
+
 # Storage limit for new mailboxes, e.g. "5G" or "500M". Empty = unlimited.
 # Change it per mailbox later with the dashboard or "mailctl user quota".
 DEFAULT_QUOTA=""

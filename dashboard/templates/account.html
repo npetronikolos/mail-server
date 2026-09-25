@@ -40,6 +40,7 @@
       <h3>Other mail apps</h3>
       <dl class="kv">
         <dt>Username</dt><dd><code class="copy">{{ info.email }}</code></dd>
+        <dt>Password</dt><dd>{{ 'an app password (below)' if apps.required else 'your password, or better an app password (below)' }}</dd>
         <dt>Incoming (IMAP)</dt><dd><code class="copy">{{ conf.MAIL_HOSTNAME }}</code> port 993, SSL/TLS</dd>
         <dt>Outgoing (SMTP)</dt><dd><code class="copy">{{ conf.MAIL_HOSTNAME }}</code> port 465, SSL/TLS</dd>
       </dl>
@@ -50,12 +51,52 @@
       <p>For Thunderbird, DAVx⁵ (Android), GNOME, macOS…</p>
       <dl class="kv">
         <dt>Server</dt><dd><code class="copy">https://{{ conf.MAIL_HOSTNAME }}/dav/</code></dd>
-        <dt>Username</dt><dd>your email address and password</dd>
+        <dt>Username</dt><dd>your email address and {{ 'an app password' if apps.required else 'password (or an app password)' }}</dd>
       </dl>
       <p><a href="/dav/.web/" target="_blank" rel="noopener">Manage calendars and address books ↗</a></p>
     </div>
     {% endif %}
   </div>
+  {% if apps.required %}<p class="muted small">The iPhone/Mac profile asks for a password when you install it: enter an app password.</p>{% endif %}
+</section>
+
+<section class="card" id="app-passwords">
+  <h2>App passwords</h2>
+  <p>Give each mail app or device its own password. If a phone is lost or you stop using an app, delete its password: your other devices keep working and your normal password stays the same.</p>
+  {% if apps.required %}
+    <p><span class="badge ok">On</span> Mail and calendar apps must use an app password. Your normal password only works in webmail and on this page, so on its own it can't be used to read or send your mail from anywhere else.</p>
+  {% endif %}
+  <form method="post" action="{{ url_for('account_app_passwords') }}" class="row wrap">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input name="name" maxlength="40" placeholder="Which app or device? (e.g. Anna's iPhone)" aria-label="App or device" required>
+    <button class="btn primary" name="action" value="add">Create app password</button>
+  </form>
+  {% if apps.passwords %}
+  <table>
+    <thead><tr><th>App or device</th><th>Created</th><th></th></tr></thead>
+    <tbody>
+    {% for p in apps.passwords %}
+      <tr>
+        <td>{{ p.name }}</td>
+        <td class="nowrap">{{ p.created[:10] }}</td>
+        <td class="actions"><form method="post" action="{{ url_for('account_app_passwords') }}" class="inline" data-confirm="Delete the app password for {{ p.name }}? That app stops working until you give it a new one.">
+          <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ p.id }}">
+          <button class="btn small danger" name="action" value="delete">Delete</button></form></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  <form method="post" action="{{ url_for('account_app_passwords') }}" class="row wrap">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    {% if apps.required %}
+      <button class="btn small" name="action" value="allow">Let mail apps use my normal password again</button>
+    {% else %}
+      <button class="btn small" name="action" value="require" data-confirm-click="Apps that still use your normal password stop working until you give each one an app password. Continue?">Only accept app passwords in mail apps</button>
+      <span class="muted small">Recommended once all your devices use app passwords.</span>
+    {% endif %}
+  </form>
+  <p class="muted small">Changing your password deletes all your app passwords.</p>
 </section>
 
 <div class="grid two">
@@ -123,6 +164,38 @@
   {% endif %}
 </section>
 
+<section class="card" id="import">
+  <h2>Import mail from another account</h2>
+  {% if imp.status == 'running' %}
+    <p><span class="badge warn">Running</span> Copying mail from <strong>{{ imp.user }}</strong> at {{ imp.host }}, started {{ ago(imp.started) }}. You can leave this page; reload it to see the progress.</p>
+    {% if imp.log %}<pre class="log short">{{ imp.log[-6:]|join('\n') }}</pre>{% endif %}
+    <form method="post" action="{{ url_for('account_import') }}" class="row" data-confirm="Stop the import? Mail copied so far is kept.">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn danger" name="action" value="cancel">Stop</button>
+    </form>
+  {% else %}
+    {% if imp.status == 'done' %}
+      <p><span class="badge ok">Done</span> {{ imp.imported }} message{{ 's' if imp.imported != 1 }} copied from {{ imp.user }} ({{ imp.host }}) {{ ago(imp.finished) }}.</p>
+    {% elif imp.status in ('failed', 'cancelled') %}
+      <p><span class="badge {{ 'error' if imp.status == 'failed' else 'warn' }}">{{ 'Failed' if imp.status == 'failed' else 'Stopped' }}</span> {{ imp.message }}</p>
+    {% endif %}
+    <p>Copies all mail and folders from your old provider into this mailbox. Nothing is deleted there or here, and running it again later only copies what is new: import once now, and again after you switch over. Spam, trash and Gmail's "All Mail" are left out.</p>
+    <form method="post" action="{{ url_for('account_import') }}" class="formgrid">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label>IMAP server <small class="muted">(e.g. imap.gmail.com, imap.mail.yahoo.com, imap.mail.me.com)</small>
+        <input name="host" value="{{ imp.host or '' }}" placeholder="imap.gmail.com" required></label>
+      <label>Security<select name="security">
+        <option value="ssl">SSL/TLS (port 993)</option>
+        <option value="starttls" {{ 'selected' if imp.security == 'starttls' }}>STARTTLS (port 143)</option></select></label>
+      <label>User name there <small class="muted">(usually the full email address)</small>
+        <input name="user" value="{{ imp.user or '' }}" autocomplete="off" required></label>
+      <label>Password there<input name="password" type="password" autocomplete="off" required></label>
+      <p class="muted small">Gmail, Yahoo and iCloud need an app password from that account's security settings. Outlook.com and Microsoft 365 no longer allow password sign-in, so they can't be imported this way.</p>
+      <button class="btn primary">Start import</button>
+    </form>
+  {% endif %}
+</section>
+
 <section class="card">
   <h2>Spam caught for you <small class="muted">(last 30 days)</small></h2>
   {% if junk %}
@@ -167,6 +240,6 @@
     <p>Protect this dashboard with a code from an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password, Bitwarden…).</p>
     <a class="btn primary" href="{{ url_for('account_2fa') }}">Turn on two-factor sign-in</a>
   {% endif %}
-  <p class="muted small">This protects the dashboard. Mail apps and webmail keep using your normal password.</p>
+  <p class="muted small">This protects the dashboard. To protect your mail apps too, give them app passwords and turn on "Only accept app passwords" above.</p>
 </section>
 {% endblock %}

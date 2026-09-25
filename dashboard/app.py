@@ -5,22 +5,21 @@ Every change goes through "sudo mailctl --json ...", which validates its
 input and records an audit log; the dashboard itself never touches mail
 configuration files.
 
-Sign-in uses the mailbox's own email password (checked against Dovecot over
-IMAP) plus an optional TOTP second factor. Mailboxes listed in
-/etc/mail-server/admins get the admin pages; everyone else gets a personal
-account page (password, 2FA, device setup, calendar/contacts links).
+Sign-in uses the mailbox's own email password (checked by mailctl; app
+passwords are refused here) plus an optional TOTP second factor. Mailboxes
+listed in /etc/mail-server/admins get the admin pages; everyone else gets a
+personal account page (password, 2FA, app passwords, device setup, mail
+import, calendar/contacts links).
 """
 import base64
 import datetime
 import hashlib
 import hmac
-import imaplib
 import io
 import json
 import os
 import re
 import secrets
-import ssl
 import subprocess
 import threading
 import time
@@ -189,17 +188,19 @@ def clear_failures(*keys):
             _failures.pop(k, None)
 
 
-def imap_login_ok(email, password):
-    """Check a mailbox password against Dovecot."""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE   # local connection to our own server
-    try:
-        with imaplib.IMAP4_SSL("127.0.0.1", 993, ssl_context=ctx, timeout=15) as m:
-            m.login(email, password)
-            return True
-    except (imaplib.IMAP4.error, UnicodeEncodeError):
+def password_ok(email, password, apps=False):
+    """Check a password. Only the mailbox password opens the dashboard (an app
+    password must not, or it could change the real one); calendars and
+    contacts (apps=True) also accept app passwords. Raises OSError when
+    mailctl cannot answer."""
+    if not password or "\n" in password:
         return False
+    try:
+        r = mailctl("user", "checkpw", email, *(["--app"] if apps else []),
+                    input=password + "\n", timeout=30)
+    except MailctlError as e:
+        raise OSError(str(e))
+    return bool(r and r.get("ok"))
 
 
 def read_admins():
@@ -398,9 +399,9 @@ def login():
             flash("Too many failed attempts. Wait 10 minutes and try again.", "error")
             return render_template("login.html", email=email), 429
         try:
-            ok = imap_login_ok(email, password)
+            ok = password_ok(email, password)
         except OSError:
-            flash("The mail server is not responding (Dovecot). Try again shortly.", "error")
+            flash("The mail server is not responding. Try again shortly.", "error")
             return render_template("login.html", email=email), 503
         if not ok:
             record_failure(f"ip:{ip}", f"user:{email}")
@@ -602,10 +603,21 @@ def mailbox_add():
 @action
 def mailbox_password(email):
     pw = _new_password(request.form)
-    mailctl("user", "passwd", email, input=pw + "\n")
+    r = mailctl("user", "passwd", email, input=pw + "\n")
+    forget_dav_logins()
+    gone = f" Its {r['app_passwords_removed']} app password(s) were deleted." if r.get("app_passwords_removed") else ""
     if request.form.get("generate"):
-        return f"New password for {email}: {pw} (shown once - copy it now)"
-    return f"Password changed for {email}."
+        return f"New password for {email}: {pw} (shown once - copy it now).{gone}"
+    return f"Password changed for {email}.{gone}"
+
+
+@app.route("/mailboxes/<email>/app-passwords", methods=["POST"])
+@admin_required
+@action
+def mailbox_app_passwords(email):
+    mailctl("user", "apppass", "require", email, "no")
+    forget_dav_logins()
+    return f"Mail apps for {email} may use the mailbox password again."
 
 
 @app.route("/mailboxes/<email>/quota", methods=["POST"])
@@ -786,6 +798,12 @@ def dav_enabled():
     return CONF.get("ENABLE_DAV") == "yes"
 
 
+def forget_dav_logins():
+    """Calendar sign-ins are cached for 5 minutes; drop them when passwords change."""
+    with _lock:
+        _dav_ok.clear()
+
+
 @app.route("/account")
 @login_required
 def account():
@@ -798,9 +816,48 @@ def account():
     temps = mailctl("alias", "temp", "list", "--owner", email)
     junk = mailctl("junk", "--user", email, "--days", "30")
     shared = [mb for mb, members in mailctl("share", "list").items() if email in members]
+    apps = mailctl("user", "apppass", "list", email)
+    imp = mailctl("user", "import", "status", email)
     return render_template("account.html", info=me, has_totp=email in totp_load(),
                            dav=dav_enabled(), rules=rules, temps=temps, junk=junk[:50],
-                           shared=shared, today=datetime.date.today().isoformat())
+                           shared=shared, apps=apps, imp=imp,
+                           today=datetime.date.today().isoformat())
+
+
+@app.route("/account/app-passwords", methods=["POST"])
+@login_required
+@action
+def account_app_passwords():
+    email = session["email"]
+    act = request.form.get("action")
+    forget_dav_logins()
+    if act == "add":
+        r = mailctl("user", "apppass", "add", email, "--name", request.form.get("name", "")[:40])
+        return (f"App password for “{r['name']}”: {r['password']} - type it into that app instead of "
+                "your normal password. It is shown only this once.")
+    if act == "delete":
+        mailctl("user", "apppass", "del", email, request.form.get("id", ""))
+        return "App password deleted. The app that used it can no longer sign in."
+    if act in ("require", "allow"):
+        mailctl("user", "apppass", "require", email, "yes" if act == "require" else "no")
+        return ("Mail apps must now use an app password. Webmail and this dashboard keep your normal password."
+                if act == "require" else "Mail apps may use your normal password again.")
+    abort(400)
+
+
+@app.route("/account/import", methods=["POST"])
+@login_required
+@action
+def account_import():
+    email = session["email"]
+    if request.form.get("action") == "cancel":
+        mailctl("user", "import", "cancel", email)
+        return "Import stopped. The mail copied so far was kept."
+    security = "starttls" if request.form.get("security") == "starttls" else "ssl"
+    mailctl("user", "import", "start", email, "--host", request.form.get("host", "").strip(),
+            "--security", security, "--user", request.form.get("user", "").strip(),
+            input=request.form.get("password", "") + "\n", timeout=120)
+    return "Import started. It runs in the background and can take hours for a large mailbox."
 
 
 @app.route("/account/forward", methods=["POST"])
@@ -986,11 +1043,19 @@ def account_password():
         raise MailctlError("the new passwords do not match")
     if too_many_failures(f"pw:{email}", limit=5):
         raise MailctlError("too many wrong passwords; try again in 10 minutes")
-    if not imap_login_ok(email, current):
+    try:
+        ok = password_ok(email, current)
+    except OSError as e:
+        raise MailctlError(str(e))
+    if not ok:
         record_failure(f"pw:{email}")
         log_auth("PASSWORD CHANGE FAILED", email)
         raise MailctlError("your current password is not correct")
-    mailctl("user", "passwd", email, input=new + "\n")
+    r = mailctl("user", "passwd", email, input=new + "\n")
+    forget_dav_logins()
+    if r.get("app_passwords_removed"):
+        return ("Password changed. Your app passwords were deleted too; create new ones for "
+                "your mail apps.")
     return "Password changed. Update it in your mail apps too."
 
 
@@ -1118,7 +1183,7 @@ def dav_auth():
         if too_many_failures(f"dav:{ip}", limit=10) or too_many_failures(f"user:{user}", limit=10):
             return Response(status=401)
         try:
-            ok = imap_login_ok(user, pw)
+            ok = password_ok(user, pw, apps=True)
         except OSError:
             return Response(status=503)
         if not ok:

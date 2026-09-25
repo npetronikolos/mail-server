@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""mail-mcp - manage this mail server from an AI assistant (Model Context Protocol).
+
+Speaks MCP over stdin/stdout and runs "mailctl --json" for every tool, so it
+can do exactly what mailctl can, with the same checks, and every change lands
+in the audit log as "mcp:<user>". Run it on the mail server through SSH; for
+Claude Code, on your own computer:
+
+    claude mcp add mail-server -- ssh root@mail.example.com /usr/local/sbin/mail-mcp
+
+Options:
+  --read-only   offer only the tools that look things up (status, logs, lists)
+
+Passwords it creates (new mailboxes, resets, app passwords) are returned to
+the assistant once, like on the dashboard. It never asks for passwords of
+other services (relay, DNS provider, old mail accounts): set those on the
+dashboard or with mailctl.
+"""
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+
+MAILCTL = os.environ.get("MAILCTL", "/usr/local/sbin/mailctl")
+CONF = "/etc/mail-server/mail-server.conf"
+VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
+USER = re.sub(r"[^A-Za-z0-9._-]", "", os.environ.get("SUDO_USER") or os.environ.get("USER") or "root")
+ACTOR = f"mcp:{USER or 'root'}"
+
+
+class ToolError(Exception):
+    pass
+
+
+class RpcError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def mailctl(*args, input=None, timeout=300):
+    cmd = [MAILCTL, "--json", "--actor", ACTOR] + [str(a) for a in args]
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n"] + cmd
+    try:
+        # Never let mailctl read our stdin: that is the MCP connection.
+        p = subprocess.run(cmd, input=input, capture_output=True, text=True, timeout=timeout,
+                           stdin=None if input is not None else subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise ToolError(f"mailctl {' '.join(map(str, args[:2]))} timed out")
+    except OSError as e:
+        raise ToolError(f"cannot run mailctl: {e}")
+    lines = p.stdout.strip().splitlines()
+    data = None
+    if lines:
+        try:
+            data = json.loads(lines[-1])
+        except ValueError:
+            pass
+    if isinstance(data, dict) and "error" in data:
+        raise ToolError(data["error"])
+    if p.returncode != 0:
+        raise ToolError((p.stderr or p.stdout or "mailctl failed").strip()[:500])
+    return data
+
+
+def hostname():
+    try:
+        with open(CONF) as f:
+            m = re.search(r'^MAIL_HOSTNAME="?([^"\s]+)', f.read(), re.M)
+            return m.group(1) if m else ""
+    except OSError:
+        return ""
+
+
+# ------------------------------------------------------------------ tools
+
+TOOLS = []
+
+
+def tool(title, description, props=None, required=(), write=False, destructive=False):
+    def add(fn):
+        TOOLS.append({"name": fn.__name__, "title": title, "description": description,
+                      "inputSchema": {"type": "object", "properties": props or {},
+                                      "required": list(required), "additionalProperties": False},
+                      "annotations": {"title": title, "readOnlyHint": not write,
+                                      "destructiveHint": destructive, "openWorldHint": False},
+                      "write": write, "fn": fn})
+        return fn
+    return add
+
+
+def s(desc, **kw):
+    return dict(type="string", description=desc, **kw)
+
+
+def n(desc, lo, hi):
+    return {"type": "integer", "description": desc, "minimum": lo, "maximum": hi}
+
+
+def yes(desc):
+    return {"type": "boolean", "description": desc}
+
+
+def strings(desc):
+    return {"type": "array", "items": {"type": "string"}, "description": desc}
+
+
+EMAIL = s("Mailbox address, e.g. anna@example.com")
+LOG_KINDS = ["mail", "postfix", "dovecot", "spam", "security", "web", "audit"]
+
+
+@tool("Server status", "Services, TLS certificate, number of domains/mailboxes/aliases, "
+      "mail queue size, disk, memory and load.")
+def server_status(a):
+    return mailctl("status")
+
+
+@tool("Health check", "Full health check: services, ports, outgoing port 25, Spamhaus listing, "
+      "certificate, backups, DANE/MTA-STS and every domain's DNS records. Takes up to a minute.",
+      {"include_dns": yes("Also check every domain's DNS records (default true)")})
+def health_check(a):
+    return mailctl("check", *([] if a.get("include_dns", True) else ["--no-dns"]))
+
+
+@tool("List domains", "Domains this server hosts mail for, with mailbox and alias counts.")
+def list_domains(a):
+    return mailctl("domain", "list")
+
+
+@tool("DNS records", "The DNS records a domain needs; with check=true, each is also looked up live "
+      "and marked ok/warn/error.",
+      {"domain": s("Domain (default: the primary domain)"), "check": yes("Verify them live")})
+def dns_records(a):
+    return mailctl("dns", *([a["domain"]] if a.get("domain") else []), *(["--check"] if a.get("check") else []))
+
+
+@tool("List mailboxes", "Every mailbox with storage used, quota, message count, admin rights and "
+      "app password status.")
+def list_mailboxes(a):
+    return mailctl("user", "list")
+
+
+@tool("Mailbox details", "One mailbox: usage, quota, aliases that deliver to it, forwarding, "
+      "vacation reply and app passwords.", {"email": EMAIL}, ["email"])
+def mailbox_details(a):
+    return {"mailbox": mailctl("user", "info", a["email"]),
+            "rules": mailctl("user", "rules", a["email"]),
+            "app_passwords": mailctl("user", "apppass", "list", a["email"])}
+
+
+@tool("List aliases", "Forwarding addresses and catch-alls with their destinations.")
+def list_aliases(a):
+    return mailctl("alias", "list")
+
+
+@tool("List shared mailboxes", "Mailboxes shared with other users (team inboxes).")
+def list_shared_mailboxes(a):
+    return mailctl("share", "list")
+
+
+@tool("Mail queue", "Outgoing mail waiting to be delivered, with the reason for each delay.")
+def mail_queue(a):
+    return mailctl("queue", "list")
+
+
+@tool("Blocked IPs", "IP addresses Fail2ban has blocked for guessing passwords, per jail.")
+def blocked_ips(a):
+    return mailctl("bans")
+
+
+@tool("Read logs", "Recent log lines. kinds: mail (Postfix+Dovecot), postfix, dovecot, spam (Rspamd), "
+      "security (Fail2ban), web (nginx+dashboard), audit (every admin change).",
+      {"kind": s("Which log", enum=LOG_KINDS), "lines": n("How many lines (default 200)", 1, 2000),
+       "grep": s("Only lines containing this text, e.g. an address or queue ID")}, ["kind"])
+def read_logs(a):
+    return mailctl("logs", a["kind"], "--lines", a.get("lines", 200), *(["--grep", a["grep"]] if a.get("grep") else []))
+
+
+@tool("Spam quarantine", "Messages the spam filter put in Junk folders.",
+      {"mailbox": s("Only this mailbox (default: all)"), "days": n("How far back (default 7)", 1, 30)})
+def spam_quarantine(a):
+    return mailctl("junk", *(["--user", a["mailbox"]] if a.get("mailbox") else []), "--days", a.get("days", 7),
+                   timeout=600)
+
+
+@tool("DMARC report", "Who sends mail using the hosted domains (from Gmail/Outlook/Yahoo reports), "
+      "what passed, and what looks like forgery.", {"days": n("How far back (default 30)", 1, 365)})
+def dmarc_report(a):
+    return mailctl("dmarc", "--days", a.get("days", 30))
+
+
+@tool("List backups", "Nightly backups on this server, newest first.")
+def list_backups(a):
+    return mailctl("backup", "list")
+
+
+@tool("Delivery settings", "Relay service, per-user sending limit, alert address and DNS provider.")
+def delivery_settings(a):
+    return {"relay": mailctl("relay"), "limit": mailctl("limit"), "alerts": mailctl("alerts"),
+            "dns_provider": mailctl("dns", "provider")}
+
+
+@tool("Mail import status", "Progress or result of importing mail from another provider into a mailbox.",
+      {"email": EMAIL}, ["email"])
+def import_status(a):
+    return mailctl("user", "import", "status", a["email"])
+
+
+@tool("Create mailbox", "Create a mailbox. A strong password is generated and returned once: pass it "
+      "on to the user.", {"email": EMAIL, "quota": s("Storage limit like 2G or 500M; 'none' = unlimited "
+                                                     "(default: the server's DEFAULT_QUOTA)")},
+      ["email"], write=True)
+def create_mailbox(a):
+    pw = secrets.token_urlsafe(15)
+    r = mailctl("user", "add", a["email"], *(["--quota", a["quota"]] if a.get("quota") else []), input=pw + "\n")
+    return dict(r or {}, password=pw, note="Shown only now; the server stores just a hash.")
+
+
+@tool("Reset mailbox password", "Set a new generated password (returned once). Also deletes the "
+      "mailbox's app passwords, so its mail apps sign out.", {"email": EMAIL}, ["email"],
+      write=True, destructive=True)
+def reset_mailbox_password(a):
+    pw = secrets.token_urlsafe(15)
+    r = mailctl("user", "passwd", a["email"], input=pw + "\n")
+    return dict(r or {}, password=pw, note="Shown only now; the server stores just a hash.")
+
+
+@tool("Set mailbox quota", "Change a mailbox's storage limit.",
+      {"email": EMAIL, "quota": s("Like 2G or 500M, or 'none' for unlimited")}, ["email", "quota"], write=True)
+def set_mailbox_quota(a):
+    return mailctl("user", "quota", a["email"], a["quota"])
+
+
+@tool("Delete mailbox", "Remove a mailbox. Its mail stays on disk unless delete_mail is true.",
+      {"email": EMAIL, "delete_mail": yes("Also delete all its mail, calendars and contacts (cannot be undone)")},
+      ["email"], write=True, destructive=True)
+def delete_mailbox(a):
+    return mailctl("user", "del", a["email"], *(["--purge"] if a.get("delete_mail") else []))
+
+
+@tool("Add alias", "Forward an address to one or more mailboxes or outside addresses. Use @domain as "
+      "the alias for a catch-all.", {"alias": s("e.g. info@example.com or @example.com"),
+                                     "destinations": strings("Where the mail goes")},
+      ["alias", "destinations"], write=True)
+def add_alias(a):
+    return mailctl("alias", "add", a["alias"], ",".join(a["destinations"]))
+
+
+@tool("Delete alias", "Remove an alias; mail to it is then refused.", {"alias": s("The alias address")},
+      ["alias"], write=True, destructive=True)
+def delete_alias(a):
+    return mailctl("alias", "del", a["alias"])
+
+
+@tool("Add domain", "Host mail for another domain: creates its DKIM key and returns the DNS records "
+      "to create.", {"domain": s("e.g. example.org")}, ["domain"], write=True)
+def add_domain(a):
+    return mailctl("domain", "add", a["domain"])
+
+
+@tool("Delete domain", "Stop hosting a domain (it must have no mailboxes left).",
+      {"domain": s("The domain")}, ["domain"], write=True, destructive=True)
+def delete_domain(a):
+    return mailctl("domain", "del", a["domain"])
+
+
+@tool("Share mailbox", "Let a user read a mailbox (it appears as Shared/<address>) and send as it, "
+      "or remove that access.", {"mailbox": s("The shared mailbox, e.g. info@example.com"),
+                                 "member": s("Who gets access"), "remove": yes("Remove access instead")},
+      ["mailbox", "member"], write=True)
+def share_mailbox(a):
+    return mailctl("share", "del" if a.get("remove") else "add", a["mailbox"], a["member"])
+
+
+@tool("Set forwarding", "Forward a mailbox's mail to up to 4 addresses (spam is never forwarded). "
+      "An empty list turns forwarding off.",
+      {"email": EMAIL, "to": strings("Forwarding addresses; empty = off"),
+       "keep_copy": yes("Keep a copy in the mailbox (default true)")}, ["email", "to"], write=True)
+def set_forwarding(a):
+    if not a["to"]:
+        return mailctl("user", "forward", a["email"], "--off")
+    return mailctl("user", "forward", a["email"], "--to", ",".join(a["to"]),
+                   *([] if a.get("keep_copy", True) else ["--no-keep"]))
+
+
+@tool("Set vacation reply", "Turn a mailbox's automatic reply on (with message, optional subject and "
+      "dates) or off (no message).",
+      {"email": EMAIL, "message": s("The reply text; leave out to turn the reply off"),
+       "subject": s("Default 'Out of office'"), "start": s("YYYY-MM-DD"), "end": s("YYYY-MM-DD")},
+      ["email"], write=True)
+def set_vacation_reply(a):
+    if not a.get("message"):
+        return mailctl("user", "vacation", a["email"], "--off")
+    args = ["user", "vacation", a["email"], "--subject", a.get("subject") or "Out of office"]
+    for k in ("start", "end"):
+        if a.get(k):
+            args += [f"--{k}", a[k]]
+    return mailctl(*args, input=a["message"])
+
+
+@tool("Mail queue action", "flush retries everything now; hold/release/delete act on one queue ID "
+      "(or ALL).", {"action": s("What to do", enum=["flush", "hold", "release", "delete"]),
+                    "queue_id": s("Queue ID from mail_queue, or ALL")}, ["action"], write=True, destructive=True)
+def mail_queue_action(a):
+    if a["action"] == "flush":
+        return mailctl("queue", "flush")
+    if not a.get("queue_id"):
+        raise ToolError("queue_id is required for hold, release and delete")
+    return mailctl("queue", a["action"], a["queue_id"])
+
+
+@tool("Unblock IP", "Remove a Fail2ban block from an IP address.", {"ip": s("IPv4 or IPv6 address")},
+      ["ip"], write=True)
+def unblock_ip(a):
+    return mailctl("unban", a["ip"])
+
+
+@tool("Spam quarantine action", "release moves a message from Junk to the inbox and teaches the spam "
+      "filter it was not spam; delete removes it.",
+      {"action": s("What to do", enum=["release", "delete"]), "mailbox": EMAIL,
+       "message_id": n("The id from spam_quarantine", 1, 4294967295)},
+      ["action", "mailbox", "message_id"], write=True, destructive=True)
+def spam_quarantine_action(a):
+    return mailctl("junk", a["action"], a["mailbox"], a["message_id"])
+
+
+@tool("Create app password", "A separate password for one mail app or device, returned once.",
+      {"email": EMAIL, "name": s("The app or device, e.g. Anna's iPhone")}, ["email"], write=True)
+def create_app_password(a):
+    return mailctl("user", "apppass", "add", a["email"], "--name", a.get("name") or "Mail app")
+
+
+@tool("Delete app password", "Revoke one app password; the app using it can no longer sign in.",
+      {"email": EMAIL, "id": s("The id from mailbox_details")}, ["email", "id"], write=True, destructive=True)
+def delete_app_password(a):
+    return mailctl("user", "apppass", "del", a["email"], a["id"])
+
+
+@tool("Require app passwords", "required=true: mail apps (IMAP, SMTP, calendars) must use app passwords; "
+      "the mailbox password keeps working in webmail and the dashboard.",
+      {"email": EMAIL, "required": yes("On or off")}, ["email", "required"], write=True)
+def require_app_passwords(a):
+    return mailctl("user", "apppass", "require", a["email"], "yes" if a["required"] else "no")
+
+
+@tool("Cancel mail import", "Stop a running import; mail copied so far is kept.", {"email": EMAIL},
+      ["email"], write=True)
+def cancel_mail_import(a):
+    return mailctl("user", "import", "cancel", a["email"])
+
+
+@tool("Apply DNS records", "Create or update a domain's DNS records at the connected DNS provider "
+      "(Cloudflare/DigitalOcean). Without confirm it only returns the plan; show it to the user first.",
+      {"domain": s("The domain"), "confirm": yes("Make the changes (default false: preview only)")},
+      ["domain"], write=True, destructive=True)
+def apply_dns_records(a):
+    return mailctl("dns", "apply", a["domain"], *(["--yes"] if a.get("confirm") else []))
+
+
+@tool("Run backup", "Start a backup now, in the background.", write=True)
+def run_backup(a):
+    return mailctl("backup", "--background")
+
+
+# ------------------------------------------------------------------ protocol
+
+def check_args(schema, args):
+    """A problem with the arguments, or None."""
+    if not isinstance(args, dict):
+        return "arguments must be an object"
+    props = schema["properties"]
+    for k in args:
+        if k not in props:
+            return f"unknown argument '{k}' (expected: {', '.join(props) or 'none'})"
+    for k in schema["required"]:
+        if k not in args:
+            return f"missing argument '{k}'"
+    for k, v in args.items():
+        p = props[k]
+        t = p["type"]
+        ok = {"string": isinstance(v, str), "boolean": isinstance(v, bool),
+              "integer": isinstance(v, int) and not isinstance(v, bool),
+              "array": isinstance(v, list) and all(isinstance(x, str) for x in v)}[t]
+        if not ok:
+            return f"'{k}' must be {'an' if t in ('integer', 'array') else 'a'} {t}"
+        if "enum" in p and v not in p["enum"]:
+            return f"'{k}' must be one of: {', '.join(p['enum'])}"
+        if t == "integer" and not p["minimum"] <= v <= p["maximum"]:
+            return f"'{k}' must be between {p['minimum']} and {p['maximum']}"
+        if k == "message":
+            continue              # goes to mailctl on stdin, not on its command line
+        for x in (v if t == "array" else [v] if t == "string" else []):
+            # A leading "-" would reach mailctl as an option (e.g. --purge).
+            if x.startswith("-") or not x.isprintable():
+                return f"'{k}' must not start with '-' or contain control characters"
+    return None
+
+
+def text(s):
+    return [{"type": "text", "text": s}]
+
+
+def call_tool(params, tools):
+    t = tools.get(params.get("name"))
+    if not t:
+        raise RpcError(-32602, f"Unknown tool: {params.get('name')}")
+    args = params.get("arguments") or {}
+    problem = check_args(t["inputSchema"], args)
+    if problem:
+        return {"content": text(problem), "isError": True}
+    try:
+        result = t["fn"](args)
+    except ToolError as e:
+        return {"content": text(str(e)), "isError": True}
+    return {"content": text(json.dumps(result, indent=1, ensure_ascii=False, default=str))}
+
+
+def handle(msg, tools, info):
+    if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
+        if isinstance(msg, dict) and "method" not in msg and ("result" in msg or "error" in msg):
+            return None           # a reply to a request; this server never sends any
+        return {"jsonrpc": "2.0", "id": msg.get("id") if isinstance(msg, dict) else None,
+                "error": {"code": -32600, "message": "Invalid request"}}
+    method, params = msg["method"], msg.get("params") or {}
+    notification = "id" not in msg
+    try:
+        if method == "initialize":
+            asked = params.get("protocolVersion")
+            result = {"protocolVersion": asked if asked in VERSIONS else VERSIONS[0],
+                      "capabilities": {"tools": {"listChanged": False}},
+                      "serverInfo": info, "instructions": INSTRUCTIONS}
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = {"tools": [{k: v for k, v in t.items() if k not in ("fn", "write")} for t in tools.values()]}
+        elif method == "tools/call":
+            result = call_tool(params, tools)
+        elif method.startswith("notifications/"):
+            return None
+        else:
+            raise RpcError(-32601, f"Method not found: {method}")
+    except RpcError as e:
+        return None if notification else {"jsonrpc": "2.0", "id": msg["id"],
+                                          "error": {"code": e.code, "message": str(e)}}
+    return None if notification else {"jsonrpc": "2.0", "id": msg["id"], "result": result}
+
+
+INSTRUCTIONS = """Manages a self-hosted mail server (Postfix, Dovecot, Rspamd) through its mailctl command.
+Start with server_status or health_check. health_check marks each item ok, warn or error and includes a fix hint.
+Every change is written to the server's audit log. Passwords the tools generate are shown once; hand them to the user.
+Ask the user before destructive actions (deleting mailboxes, aliases, domains or queued mail; resetting passwords).
+apply_dns_records without confirm only previews: show the plan and wait for the user's go-ahead."""
+
+
+def main(argv):
+    if any(x in ("-h", "--help") for x in argv):
+        print(__doc__.strip())
+        return 0
+    read_only = "--read-only" in argv
+    tools = {t["name"]: t for t in TOOLS if not (read_only and t["write"])}
+    host = hostname()
+    info = {"name": "mail-server", "title": f"Mail server {host}".strip(), "version": "1.0.0"}
+    out = sys.stdout
+    for raw in sys.stdin.buffer:
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            reply = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+        else:
+            if isinstance(msg, list):
+                reply = [r for r in (handle(m, tools, info) for m in msg) if r] or None
+            else:
+                reply = handle(msg, tools, info)
+        if reply:
+            out.write(json.dumps(reply) + "\n")   # ASCII-only: safe whatever the SSH locale
+            out.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

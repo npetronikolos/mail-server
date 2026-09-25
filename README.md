@@ -4,11 +4,13 @@ A complete email server for **Ubuntu Server 24.04 LTS and 26.04 LTS**, installed
 directly on the machine with one script. No Docker.
 
 It includes a web **admin dashboard** with two-factor sign-in, **calendars and
-contacts**, **shared mailboxes**, **mailbox quotas**, **MTA-STS**, live **DNS
-and health checks**, **email alerts**, **DMARC reports**, a **spam
+contacts**, **shared mailboxes**, **mailbox quotas**, **MTA-STS** and **DANE**,
+live **DNS and health checks**, **email alerts**, **DMARC reports**, a **spam
 quarantine**, **automatic DNS records** (Cloudflare, DigitalOcean), an optional
 **relay service** for outgoing mail, and a self-service page where every user
-can set forwarding, vacation replies and throwaway addresses.
+can set forwarding, vacation replies, throwaway addresses and **app passwords**,
+and **import their mail from Gmail or another provider**. An **MCP server**
+lets an AI assistant such as Claude manage the server for you.
 
 ![Admin dashboard](docs/screenshots/overview.png)
 
@@ -18,18 +20,21 @@ can set forwarding, vacation replies and throwaway addresses.
 | **Dovecot** | Stores mailboxes and serves them to mail apps over IMAP (port 993). Handles quotas, shared mailboxes, full-text search and server-side filters (Sieve) |
 | **Rspamd** + Redis | Spam filtering, greylisting, DKIM signing and ARC. Learns from what users move in or out of Junk |
 | **ClamAV** | Virus scanning (optional) |
-| **Unbound** | Local DNS resolver, so spam blocklists such as Spamhaus work |
+| **Unbound** | Local DNS resolver that checks DNSSEC, so spam blocklists such as Spamhaus and DANE work |
 | **Roundcube** | Webmail at `https://mail.yourdomain.com/`, with filters and vacation replies |
 | **Admin dashboard** | `https://mail.yourdomain.com/admin/`: domains, mailboxes, aliases, shared mailboxes, quotas, DNS checks and automation, health checks, mail queue, spam quarantine, DMARC reports, relay, sending limits, alerts, blocked IPs, logs, backups, 2FA |
 | **Radicale** | Calendars and contacts (CalDAV/CardDAV) at `/dav/`, using the email password |
 | **MTA-STS** + TLS-RPT | Tells Gmail, Outlook and others to only send to you encrypted, and to report problems. Outgoing mail also honours other domains' MTA-STS |
+| **DANE** | Outgoing mail to domains that publish TLSA records in signed DNS only goes out over encryption verified against those records |
 | **Let's Encrypt** | Free TLS certificates, renewed automatically |
 | **Fail2ban** + UFW | Blocks password-guessing (mail, webmail, dashboard, calendars) and closes every unused port |
 | **mailctl** | One command to manage everything from the terminal, with JSON output |
+| **mail-mcp** | MCP server: lets an AI assistant (Claude Code, Claude Desktop…) run `mailctl` for you over SSH |
 
 Also included:
 - **Alerts and reports:** emails about problems as they happen, and a weekly report.
-- **Protection against stolen passwords:** a limit on how many messages each user can send per hour.
+- **Protection against stolen passwords:** a limit on how many messages each user can send per hour, and app passwords, so a leaked mailbox password can't be used from mail apps.
+- **Moving in:** users copy their old mail and folders from Gmail, Yahoo, iCloud or any IMAP server themselves.
 - **Backups:** nightly, optionally copied off-site.
 - **Security updates:** installed automatically.
 - **Automatic setup** for Thunderbird, Outlook, iPhone and Mac.
@@ -48,7 +53,9 @@ A summary of what the well-known self-hosted mail servers offer out of the box:
 | Ubuntu 26.04 LTS | ✅ | ✅ (Docker) | ❌ | ✅ (Docker) | ✅ |
 | Web admin dashboard | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Two-factor sign-in (TOTP) for admins | ✅ | ✅ | ✅ | ✅ | ❌ |
+| App passwords for mail apps | ✅ | ✅ | ❌ | ✅ tokens | ❌ |
 | Self-service page for users | ✅ | ✅ | ❌ | ✅ | ❌ |
+| Import mail from another provider | ✅ web UI | ✅ sync jobs | ❌ | fetchmail | ❌ |
 | Live DNS record checks | ✅ | ✅ | ✅ | ❌ | ❌ |
 | Server health checks (blocklists, ports, certs) | ✅ | partly | ✅ | ❌ | ❌ |
 | Mailbox quotas (refused at SMTP time) | ✅ | ✅ | ❌ | ✅ | ✅ |
@@ -73,6 +80,7 @@ A summary of what the well-known self-hosted mail servers offer out of the box:
 | Unblock banned IPs from the web UI | ✅ | ✅ | ❌ | ❌ | ❌ |
 | Audit log of admin changes | ✅ | ✅ | ❌ | ❌ | ❌ |
 | Off-site backup copies | ✅ rsync | ✅ | ✅ S3/rsync | ❌ | ❌ |
+| Managed by an AI assistant (MCP server) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Minimum RAM | ~1.5 GB (3 GB with ClamAV) | 6 GB | 1 GB | 2 GB | 2 GB |
 
 The goal was mailcow-level features on a plain Ubuntu server, using only
@@ -132,6 +140,7 @@ At minimum, set `DOMAIN`, `MAIL_HOSTNAME`, `SERVER_IPV4`, `ADMIN_EMAIL` and
 | `ADMIN_ALLOWED_IPS` | *(anywhere)* | Only allow the dashboard from these IPs or networks |
 | `ENABLE_DAV` | `yes` | Calendars and contacts at `/dav/` |
 | `ENABLE_MTA_STS` / `MTA_STS_MODE` | `yes` / `enforce` | MTA-STS policy for your domains |
+| `ENABLE_DANE` | `yes` | Check other domains' DANE (TLSA) records when sending. Makes the local Unbound the server's DNS resolver |
 | `DEFAULT_QUOTA` | *(unlimited)* | Storage limit for new mailboxes, e.g. `5G` |
 | `ENABLE_CLAMAV` | `yes` | Virus scanning (needs about 1.5 GB RAM) |
 | `ENABLE_WEBMAIL` | `yes` | Roundcube webmail |
@@ -198,7 +207,7 @@ password.
 | **Security** | IPs blocked by Fail2ban (unblock with one click), dashboard sign-ins, audit log of every admin change |
 | **Logs** | Mail, spam filter, security, web and audit logs, with search |
 | **Backups** | List backups, run one now, off-site copy status |
-| **My account** | Change password, turn on 2FA, iPhone/Mac profile, mail app and calendar settings |
+| **My account** | Change password, turn on 2FA, app passwords, import mail, iPhone/Mac profile, mail app and calendar settings |
 
 <p>
 <img src="docs/screenshots/mailboxes.png" width="49%" alt="Mailboxes">
@@ -210,6 +219,8 @@ password.
 - **Vacation reply:** an auto-reply, optionally between two dates.
 - **Throwaway addresses:** random addresses for sign-ups, with an optional expiry date.
 - **Their own spam:** see what the filter caught, and rescue what isn't spam.
+- **App passwords:** a separate password for each mail app or device (see [App passwords](#app-passwords)).
+- **Import mail:** copy everything from their old provider (see [Importing mail](#importing-mail-from-another-provider)).
 - **Mailboxes shared with them.**
 - **Account basics:** storage usage, password change, two-factor sign-in, a one-tap iPhone/Mac setup profile, and settings for any other mail or calendar app.
 
@@ -225,8 +236,9 @@ password.
 - It runs as its own unprivileged user. The only privileged thing it can do
   is run `mailctl` (a single sudo rule), which validates everything and
   records who changed what.
-- Passwords are checked against the mail server itself. There's no separate
-  admin password to leak.
+- Passwords are checked against the mailbox's own password. There's no
+  separate admin password to leak, and app passwords can't be used to sign in
+  here.
 - Two-factor sign-in (TOTP), with replay protection.
 - Protection against request forgery on every form, a strict Content Security
   Policy (no external scripts or styles), secure session cookies, and
@@ -283,6 +295,16 @@ mailctl user vacation anna@example.com --off
 mailctl alias temp add anna@example.com --days 30 --note "online shop"   # throwaway address
 mailctl alias temp list | temp del <address>
 
+# App passwords
+mailctl user apppass add anna@example.com --name "Anna's iPhone"   # prints it once
+mailctl user apppass list anna@example.com
+mailctl user apppass del anna@example.com <id>
+mailctl user apppass require anna@example.com yes    # mail apps must use app passwords
+
+# Importing mail (runs in the background; safe to run again)
+echo "OLD-PASSWORD" | mailctl user import start anna@example.com --host imap.gmail.com --user anna@gmail.com
+mailctl user import status anna@example.com | import cancel anna@example.com
+
 # Shared mailboxes
 mailctl share add info@example.com anna@example.com   # anna can read info@ and send as it
 mailctl share del info@example.com anna@example.com
@@ -315,7 +337,8 @@ mailctl admin list
 Notes:
 
 - Passwords must be at least 10 characters. Changes take effect immediately:
-  `mailctl` only returns once the mail server is using them.
+  `mailctl` only returns once the mail server is using them. Changing a
+  mailbox's password also deletes its app passwords.
 - A user can send email **as their own address and as any alias that
   delivers to them**. Any other From: address is refused. The owner of a
   catch-all can send as any address in that domain.
@@ -336,6 +359,57 @@ users can also read. Create it on the **Mailboxes** page, then use
 - Read and unread status is tracked separately for each person.
 - Members can send mail as the shared address.
 - New folders in a shared mailbox are shared automatically each night.
+
+## App passwords
+
+Each user can give every mail app or device its own password, on **My
+account → App passwords** (or `mailctl user apppass add`). The password is
+shown once, as four groups of letters and digits. If a phone is lost, delete
+its app password: the other devices keep working and the mailbox password
+stays the same.
+
+App passwords work for IMAP, sending mail (SMTP) and calendars and contacts.
+They never open the dashboard, so they can't be used to change the real
+password.
+
+**Only accept app passwords in mail apps.** Once every device has its own app
+password, turn this on. The mailbox password then only works in webmail and
+the dashboard (where two-factor sign-in can protect it). A password stolen by
+phishing or a data breach can then no longer be used to read mail over IMAP
+or send spam through your server.
+
+- Changing the mailbox password deletes all its app passwords, in case
+  whoever knew the old password created some.
+- An admin can lift the requirement on **Mailboxes → Manage** if a user locks
+  themselves out.
+- Mail apps that keep trying the old password get their IP blocked by
+  Fail2ban after a few attempts, so update every device first.
+
+## Importing mail from another provider
+
+On **My account → Import mail from another account**, users enter their old
+provider's IMAP server, user name and password. The server then copies all
+their mail and folders in the background; large mailboxes take hours, and the
+page shows the progress.
+
+- Nothing is deleted, neither at the old provider nor here, and mail that
+  already arrived here is kept.
+- Running it again only copies what is new. A good plan: import once, switch
+  the MX record, then import again to pick up the last messages. Messages
+  deleted here in between come back on the second run.
+- Spam, trash and Gmail's "All Mail", "Starred" and "Important" (copies of
+  mail in other folders) are skipped. Gmail's "Sent Mail" and "Drafts" are
+  merged into the normal Sent and Drafts folders.
+- **Gmail, Yahoo and iCloud** need an app password from the account's
+  security settings (the IMAP servers are `imap.gmail.com`,
+  `imap.mail.yahoo.com` and `imap.mail.me.com`). **Outlook.com and Microsoft
+  365** no longer allow IMAP sign-in with a password, so they can't be
+  imported this way.
+- The old password is only kept in a root-only file under `/run` while the
+  import runs.
+- Only port 993 (SSL/TLS) or 143 (STARTTLS), and only servers on the
+  internet. From the terminal, `--allow-private` also allows servers on your
+  own network.
 
 ## Sending through a relay service
 
@@ -379,6 +453,61 @@ mail using your domain, and whether it passed.
   sends mail as your domain (a newsletter tool, invoicing, your website)
   that you still need to add to SPF/DKIM.
 
+## Encryption of outgoing mail: MTA-STS and DANE
+
+Mail between servers is encrypted whenever the other side supports it. Two
+standards let a domain insist on it, and this server honours both when it
+sends:
+
+- **MTA-STS** (used by Gmail, Outlook, Yahoo): a policy published on the
+  domain's website.
+- **DANE** (common in Germany, the Netherlands and Scandinavia, e.g.
+  posteo.de, mailbox.org, many ISPs): the receiving server's certificate is
+  published as a TLSA record in DNSSEC-signed DNS.
+
+For such domains, mail only goes out if the connection is encrypted and the
+server proves it is the right one. Otherwise it waits in the queue instead of
+going out unprotected.
+
+DANE needs a DNS resolver that checks DNSSEC signatures, so with
+`ENABLE_DANE="yes"` (the default) the installer makes the local Unbound
+resolver the whole server's resolver. It only does this once it has seen
+Unbound validate. Set `ENABLE_DANE="no"` and re-run the installer to go back
+to your provider's resolver, e.g. if the server must resolve private DNS
+names. **Health checks** shows whether DANE is active. With a relay service,
+the relay handles delivery and this doesn't apply.
+
+## Managing the server from an AI assistant (MCP)
+
+`mail-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
+server. It lets an AI assistant check the server's health, read logs, and
+manage mailboxes, aliases, domains, the queue and the spam quarantine. It
+runs on the mail server and is reached over SSH, so there is no new port or
+password.
+
+With [Claude Code](https://claude.com/claude-code), on your own computer:
+
+```bash
+claude mcp add mail-server -- ssh root@mail.example.com /usr/local/sbin/mail-mcp
+# or look-only (status, health, logs, lists):
+claude mcp add mail-server -- ssh root@mail.example.com /usr/local/sbin/mail-mcp --read-only
+```
+
+Then ask things like *"Is anything wrong with the mail server?"*, *"Why is
+mail to example.org stuck?"* or *"Create a mailbox for bob@example.com with
+5 GB"*. For Claude Desktop and other MCP clients, use `ssh` as the command
+and `root@mail.example.com /usr/local/sbin/mail-mcp` as its arguments.
+
+- Every tool runs `mailctl`, so the same checks apply and every change is in
+  the audit log (as `mcp:<user>`).
+- Tools that change or delete things are marked as such, so the assistant
+  asks you before using them.
+- Passwords it creates (new mailboxes, resets, app passwords) are shown once,
+  as on the dashboard. It never asks for other passwords: set up the relay,
+  DNS provider and mail imports on the dashboard.
+- Use a key-only SSH login. Anyone who can run `mail-mcp` can do what `mailctl`
+  can.
+
 ## Mail app settings
 
 | | Server | Port | Security |
@@ -387,7 +516,8 @@ mail using your domain, and whether it passed.
 | Outgoing (SMTP) | `mail.example.com` | 465 | SSL/TLS |
 | Outgoing (alternative) | `mail.example.com` | 587 | STARTTLS |
 
-The username is the **full email address**. Automatic setup:
+The username is the **full email address**; the password is the mailbox
+password or an [app password](#app-passwords). Automatic setup:
 
 - **Thunderbird and K-9/Thunderbird for Android:** type the email address and
   password, and it finds the rest.
@@ -482,7 +612,8 @@ sudo ./install.sh              # re-applies configuration and restarts everythin
 - [ ] Send a mail to the address shown on <https://www.mail-tester.com> and
       aim for 10/10.
 - [ ] Check TLS and MTA-STS: <https://internet.nl/test-mail/>.
-- [ ] Set up the account on your phone and send and receive a message.
+- [ ] Create an app password, set up the account on your phone with it, and
+      send and receive a message.
 - [ ] Turn on two-factor sign-in for the dashboard.
 
 ## Troubleshooting
@@ -493,7 +624,9 @@ sudo ./install.sh              # re-applies configuration and restarts everythin
 | Let's Encrypt fails | Port 80 must be reachable from the internet, and the A record must point to this server. |
 | Mail lands in Gmail/Outlook spam | Dashboard → Domains & DNS: every record green? PTR set? Test with mail-tester.com. A new IP needs a few days of normal sending to build a reputation. |
 | Outgoing mail stays in the queue | Dashboard → Mail queue shows the reason. "Connection timed out" to port 25 means your provider blocks outgoing port 25. |
-| A user can't log in | Dashboard → Security: is their IP blocked? Unblock it there. Or `sudo doveadm auth test user@example.com`. |
+| A user can't log in | Dashboard → Security: is their IP blocked? Unblock it there. Or `sudo doveadm auth test user@example.com`. If the mailbox only accepts app passwords, the mail app needs one (My account → App passwords). |
+| A mail import failed | My account (or `sudo mailctl user import status user@example.com`) shows the error. "Authentication failed": the old provider wants an app password. Starting it again continues where it stopped. |
+| Mail to one domain waits with "TLSA" or "DANE" in the reason | That domain publishes DANE records that its own server doesn't match. It is their problem to fix; the mail is delivered once they do. |
 | Locked out of the dashboard (lost 2FA phone) | Another admin can use Mailboxes → Manage → Reset 2FA. Or on the server, edit `/var/lib/mail-dashboard/totp.json` and remove your line. |
 | See what is happening | Dashboard → Logs, or `sudo journalctl -u postfix -u dovecot -f`. |
 
@@ -514,6 +647,9 @@ sudo ./install.sh              # re-applies configuration and restarts everythin
 | `/var/log/mail-dashboard/auth.log` | Dashboard and calendar sign-ins |
 | `/etc/mail-server/settings.json` | Relay, sending limit and alert settings (changed from the dashboard) |
 | `/etc/mail-server/shares.json`, `temp-aliases.json` | Shared mailboxes and throwaway addresses |
+| `/etc/mail-server/app-passwords.json` | App passwords (hashes only) and who requires them |
+| `/etc/dovecot/app-passwords/` | Dovecot's copy: one file per app password (made by `mailctl`) |
+| `/var/lib/mail-server/imports/` | Status and log of each mailbox's mail import |
 | `/var/lib/mail-server/dmarc/` | Received DMARC reports |
 | `/var/backups/mail-server/` | Nightly backups |
 
@@ -525,11 +661,13 @@ mail-server.conf.example     settings template
 bin/mailctl                  management command (Python; installed to /usr/local/sbin)
 bin/mail-backup              backup script (runs nightly from cron)
 bin/mail-dmarc-ingest        reads incoming DMARC reports (run by Postfix)
+bin/mail-mcp                 MCP server for AI assistants (runs mailctl)
 bin/mail-server-fix-packages
                              works around bugs in Ubuntu packages (Roundcube on PHP 8.5,
                              MTA-STS resolver on Python 3.14)
 dashboard/                   the admin dashboard (Flask, served by gunicorn)
 templates/                   configuration files for every service
 DNS.md                       DNS records explained
+CLAUDE.md                    notes for AI coding assistants working on this repository
 docs/screenshots/            dashboard screenshots
 ```

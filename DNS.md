@@ -96,6 +96,12 @@ deliver to you over an unencrypted or forged connection. The policy is in
 change whenever the policy changes, so always copy the current value from the
 dashboard or `mailctl dns`.
 
+**About DANE.** When sending, this server checks other domains' DANE (TLSA)
+records automatically; there is nothing to set up. Publishing TLSA records for
+your own domain, so that other servers can check yours, needs DNSSEC signing
+at your DNS provider and records that follow every certificate renewal. That
+isn't automated here, and MTA-STS already covers Gmail, Outlook and Yahoo.
+
 **Additional domains.** `sudo mailctl domain add example.org` prints the records
 for the new domain (so does the dashboard). It needs MX, SPF, DKIM and DMARC,
 plus whichever recommended records you want. The A and PTR records stay those
