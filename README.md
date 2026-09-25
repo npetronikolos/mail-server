@@ -4,29 +4,37 @@ A complete email server for **Ubuntu Server 24.04 LTS and 26.04 LTS**, installed
 directly on the machine with one script. No Docker.
 
 It includes a web **admin dashboard** with two-factor sign-in, **calendars and
-contacts**, **mailbox quotas**, **MTA-STS**, live **DNS and health checks**
-and a self-service page for every user.
+contacts**, **shared mailboxes**, **mailbox quotas**, **MTA-STS**, live **DNS
+and health checks**, **email alerts**, **DMARC reports**, a **spam
+quarantine**, **automatic DNS records** (Cloudflare, DigitalOcean), an optional
+**relay service** for outgoing mail, and a self-service page where every user
+can set forwarding, vacation replies and throwaway addresses.
 
 ![Admin dashboard](docs/screenshots/overview.png)
 
 | Part | What it does |
 | --- | --- |
 | **Postfix** + postscreen | Receives mail from the internet (port 25) and sends mail for your users (ports 587 and 465). Bots are dropped before they reach the mail server |
-| **Dovecot** | Stores mailboxes and serves them to mail apps over IMAP (port 993). Handles quotas and server-side filters (Sieve) |
+| **Dovecot** | Stores mailboxes and serves them to mail apps over IMAP (port 993). Handles quotas, shared mailboxes, full-text search and server-side filters (Sieve) |
 | **Rspamd** + Redis | Spam filtering, greylisting, DKIM signing and ARC. Learns from what users move in or out of Junk |
 | **ClamAV** | Virus scanning (optional) |
 | **Unbound** | Local DNS resolver, so spam blocklists such as Spamhaus work |
 | **Roundcube** | Webmail at `https://mail.yourdomain.com/`, with filters and vacation replies |
-| **Admin dashboard** | `https://mail.yourdomain.com/admin/`: domains, mailboxes, aliases, quotas, DNS checks, health checks, mail queue, blocked IPs, logs, backups, 2FA |
+| **Admin dashboard** | `https://mail.yourdomain.com/admin/`: domains, mailboxes, aliases, shared mailboxes, quotas, DNS checks and automation, health checks, mail queue, spam quarantine, DMARC reports, relay, sending limits, alerts, blocked IPs, logs, backups, 2FA |
 | **Radicale** | Calendars and contacts (CalDAV/CardDAV) at `/dav/`, using the email password |
 | **MTA-STS** + TLS-RPT | Tells Gmail, Outlook and others to only send to you encrypted, and to report problems. Outgoing mail also honours other domains' MTA-STS |
 | **Let's Encrypt** | Free TLS certificates, renewed automatically |
 | **Fail2ban** + UFW | Blocks password-guessing (mail, webmail, dashboard, calendars) and closes every unused port |
 | **mailctl** | One command to manage everything from the terminal, with JSON output |
 
-Also included: nightly backups (optionally copied off-site), automatic
-security updates, automatic setup for Thunderbird, Outlook, iPhone and Mac,
-multiple domains on one server, and an audit log of every admin change.
+Also included:
+- **Alerts and reports:** emails about problems as they happen, and a weekly report.
+- **Protection against stolen passwords:** a limit on how many messages each user can send per hour.
+- **Backups:** nightly, optionally copied off-site.
+- **Security updates:** installed automatically.
+- **Automatic setup** for Thunderbird, Outlook, iPhone and Mac.
+- **Multiple domains** on one server.
+- **An audit log** of every admin change.
 
 ---
 
@@ -52,6 +60,16 @@ A summary of what the well-known self-hosted mail servers offer out of the box:
 | iPhone/Mac setup profile | ✅ | ✅ | ✅ | ❌ | ❌ |
 | Outlook and Thunderbird auto-setup | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Mail queue management in the web UI | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Spam quarantine in the web UI | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Users set forwarding and vacation replies | ✅ | ✅ | via webmail | ✅ | via webmail |
+| Shared mailboxes (team inboxes) | ✅ | ✅ | ❌ | ❌ | paid version |
+| Throwaway addresses | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Full-text search of mailboxes | ✅ | ✅ | ❌ | ✅ | ❌ |
+| Relay service for outgoing mail | ✅ web UI | ✅ web UI | manual | config file | manual |
+| Per-user sending limit | ✅ | ✅ | ❌ | ✅ | ❌ |
+| Alert emails when something breaks | ✅ + weekly report | ✅ | ✅ daily status | ❌ | ❌ |
+| DMARC report viewer | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Creates DNS records automatically | ✅ Cloudflare, DigitalOcean | ❌ | ✅ runs its own DNS | ❌ | ❌ |
 | Unblock banned IPs from the web UI | ✅ | ✅ | ❌ | ❌ | ❌ |
 | Audit log of admin changes | ✅ | ✅ | ❌ | ❌ | ❌ |
 | Off-site backup copies | ✅ rsync | ✅ | ✅ S3/rsync | ❌ | ❌ |
@@ -118,6 +136,14 @@ At minimum, set `DOMAIN`, `MAIL_HOSTNAME`, `SERVER_IPV4`, `ADMIN_EMAIL` and
 | `ENABLE_CLAMAV` | `yes` | Virus scanning (needs about 1.5 GB RAM) |
 | `ENABLE_WEBMAIL` | `yes` | Roundcube webmail |
 | `BACKUP_RSYNC_TARGET` | *(none)* | Copy every backup to another machine over SSH |
+| `RELAY_HOST` (+ `RELAY_PORT`, `RELAY_USER`, `RELAY_PASSWORD`, `RELAY_SPF`) | *(none)* | Send outgoing mail through a relay service |
+| `OUTGOING_LIMIT_PER_HOUR` | `200` | Messages each user may send per hour |
+| `ALERT_EMAIL` / `WEEKLY_REPORT` | `LETSENCRYPT_EMAIL` / `yes` | Where problem alerts and the weekly report go |
+| `DNS_PROVIDER` / `DNS_API_TOKEN` | *(none)* | Create DNS records automatically (`cloudflare` or `digitalocean`) |
+
+The relay, limit, alert and DNS settings are applied at the first install;
+after that, change them on the dashboard's **Delivery & alerts** page (or
+with `mailctl`).
 
 ### 4. Run the installer
 
@@ -133,9 +159,14 @@ keys.
 
 ### 5. Create the remaining DNS records
 
-Open the dashboard, go to **Domains & DNS**, and pick your domain. Each record
-has a click-to-copy value and a live status column showing whether it's
-correct yet. From the terminal: `sudo mailctl dns --check`.
+**Automatically:** if you set `DNS_PROVIDER` and `DNS_API_TOKEN`, the installer
+already created them. You can also connect Cloudflare or DigitalOcean later on
+the dashboard's **Delivery & alerts** page. Then use **Create records at …** on
+a domain's page: it shows every change and makes them only after you confirm.
+
+**By hand:** open the dashboard, go to **Domains & DNS**, and pick your domain.
+Each record has a click-to-copy value and a live status column showing whether
+it's correct yet. From the terminal: `sudo mailctl dns --check`.
 See **[DNS.md](DNS.md)** for what each record does.
 
 ### 6. Secure the dashboard and test
@@ -158,9 +189,12 @@ password.
 | **Overview** | Service status, disk/memory/load, certificate expiry, spam filter statistics, recent messages |
 | **Health checks** | Services, ports, outgoing port 25, Spamhaus listing, certificate, backups and every DNS record, each with a fix hint |
 | **Domains & DNS** | Add and remove domains. Each domain's DNS records with live status and click-to-copy values |
-| **Mailboxes** | Create (with a generated password if you like), change passwords, set quotas, grant admin rights, reset 2FA, delete. Usage bars and search |
+| **Mailboxes** | Create (with a generated password if you like), change passwords, set quotas, share with other users, grant admin rights, reset 2FA, delete. Usage bars and search |
 | **Aliases** | Forwarding addresses, to several recipients or outside addresses, and catch-alls |
 | **Mail queue** | See why mail is stuck, retry, hold, release or delete |
+| **Spam quarantine** | Everything the spam filter put in anyone's Junk folder. "Not spam" moves it to the inbox and trains the filter |
+| **DMARC reports** | Who sends mail using your domains (from Gmail, Outlook and Yahoo's daily reports), what passed, and what looks like forgery |
+| **Delivery & alerts** | Relay service (set up and test), per-user sending limit, alert address and weekly report, DNS provider connection |
 | **Security** | IPs blocked by Fail2ban (unblock with one click), dashboard sign-ins, audit log of every admin change |
 | **Logs** | Mail, spam filter, security, web and audit logs, with search |
 | **Backups** | List backups, run one now, off-site copy status |
@@ -172,10 +206,19 @@ password.
 </p>
 
 **Users who aren't admins** can sign in too. They get only **My account**:
-their storage usage, a password change form, two-factor sign-in, a one-tap
-iPhone/Mac setup profile, and the settings for any other mail or calendar app.
+- **Forwarding:** forward their mail elsewhere, keeping a copy or not. Spam is never forwarded.
+- **Vacation reply:** an auto-reply, optionally between two dates.
+- **Throwaway addresses:** random addresses for sign-ups, with an optional expiry date.
+- **Their own spam:** see what the filter caught, and rescue what isn't spam.
+- **Mailboxes shared with them.**
+- **Account basics:** storage usage, password change, two-factor sign-in, a one-tap iPhone/Mac setup profile, and settings for any other mail or calendar app.
 
-<img src="docs/screenshots/account.png" width="70%" alt="Self-service account page">
+<img src="docs/screenshots/account.png" width="60%" alt="Self-service account page: forwarding, vacation reply, throwaway addresses, spam">
+
+<p>
+<img src="docs/screenshots/delivery.png" width="49%" alt="Delivery and alerts: relay, sending limit, alerts, DNS automation">
+<img src="docs/screenshots/dmarc.png" width="49%" alt="DMARC reports">
+</p>
 
 **How it's secured:**
 
@@ -233,6 +276,37 @@ mailctl logs [mail|postfix|dovecot|spam|security|web|audit] [--grep TEXT] [--lin
 mailctl backup [--background] | backup list
 mailctl cert                                      # add mta-sts/autoconfig/autodiscover names to the certificate
 
+# Users' own settings
+mailctl user forward anna@example.com --to me@gmail.com [--no-keep] | --off
+echo "Back Monday." | mailctl user vacation anna@example.com --subject "Away" --end 2026-10-10
+mailctl user vacation anna@example.com --off
+mailctl alias temp add anna@example.com --days 30 --note "online shop"   # throwaway address
+mailctl alias temp list | temp del <address>
+
+# Shared mailboxes
+mailctl share add info@example.com anna@example.com   # anna can read info@ and send as it
+mailctl share del info@example.com anna@example.com
+mailctl share list
+
+# Spam quarantine and search
+mailctl junk [--user anna@example.com] [--days 7]
+mailctl junk release|delete <mailbox> <id>
+mailctl search rebuild [email]
+
+# Delivery, limits, alerts
+echo "API-KEY" | mailctl relay set smtp-relay.brevo.com --port 587 --user me@x.com --spf include:spf.brevo.com
+mailctl relay [status] | relay test | relay off
+mailctl limit set 200                              # messages per user per hour (0 = no limit)
+mailctl alerts config --email me@gmail.com --weekly yes
+mailctl alerts [status] | alerts run | alerts test
+mailctl report --force                             # weekly report now
+mailctl dmarc [--days 30]
+
+# DNS automation
+echo "API-TOKEN" | mailctl dns provider set cloudflare     # or digitalocean
+mailctl dns apply example.com                      # preview
+mailctl dns apply example.com --yes                # make the changes
+
 # Dashboard access
 mailctl admin add|del <email>
 mailctl admin list
@@ -250,6 +324,60 @@ Notes:
   server is still connected, so it doesn't bounce later. On Ubuntu 26.04
   (Dovecot 2.4), a mailbox may go up to 10 MB over its limit so that the last
   message still fits.
+
+## Shared mailboxes
+
+A shared mailbox is a normal mailbox, like `info@` or `support@`, that other
+users can also read. Create it on the **Mailboxes** page, then use
+**Manage → Share with** for each team member.
+
+- Members see it as a folder, `Shared/info@example.com`, in their mail apps
+  and in webmail. They don't need its password.
+- Read and unread status is tracked separately for each person.
+- Members can send mail as the shared address.
+- New folders in a shared mailbox are shared automatically each night.
+
+## Sending through a relay service
+
+If your hosting provider blocks outgoing port 25, or you want to send through
+a service with an established reputation, use a relay. Examples: Brevo,
+Mailgun, Amazon SES, Postmark, SMTP2GO.
+
+Set it up on **Delivery & alerts → Relay service**, or with `RELAY_*` in
+`mail-server.conf`, then use **Test connection**. Add the relay's SPF entry
+(e.g. `include:spf.brevo.com`) so that `mailctl dns` and the Domains page show
+the right SPF record.
+
+Incoming mail still arrives directly on port 25. DKIM signing stays on this
+server, so DMARC keeps passing.
+
+## Alerts, sending limit and weekly report
+
+- **Alerts.** Every 15 minutes the server runs its health check. It emails
+  `ALERT_EMAIL` (or `LETSENCRYPT_EMAIL`) when a new problem appears and again
+  when it's fixed. Covered: services, certificate expiry, Spamhaus listing,
+  outgoing connectivity, disk, backups, the mail queue and DNS. A problem
+  that stays unresolved is repeated once a day.
+- **Sending limit.** Each user may send `OUTGOING_LIMIT_PER_HOUR` messages per
+  hour (200 by default). When someone hits it, their extra mail is delayed,
+  not lost, and you get an alert. A sudden burst of mail usually means a
+  password was stolen.
+- **Weekly report.** Every Monday morning you get a summary: mail received and
+  sent, spam caught, health, the largest mailboxes, DMARC results and the
+  last backup.
+
+## DMARC reports
+
+Your `_dmarc` record asks big mail providers to send daily reports to
+`dmarc-reports@<your domain>`. The server reads these automatically; there's
+no mailbox to fill up. The **DMARC reports** page shows every server that sent
+mail using your domain, and whether it passed.
+
+- **Your own server** should always pass.
+- **Failures from other servers** mean one of two things. Either someone is
+  forging your domain, which DMARC then blocks. Or you use a service that
+  sends mail as your domain (a newsletter tool, invoicing, your website)
+  that you still need to add to SPF/DKIM.
 
 ## Mail app settings
 
@@ -288,6 +416,9 @@ so they also work when no app is open.
 
 ## Spam
 
+- Everything caught is visible on the **Spam quarantine** page, and to each
+  user on their account page. "Not spam" rescues a message and trains the
+  filter.
 - Mail with a score of 15 or more is **rejected**.
 - Mail with a score of 6 or more is **delivered to Junk**.
 - Mail with a score between 4 and 6 is **greylisted**: the sender is asked to
@@ -381,6 +512,9 @@ sudo ./install.sh              # re-applies configuration and restarts everythin
 | `/var/lib/rspamd/dkim/` | DKIM private keys |
 | `/var/log/mailctl.log` | Audit log: every change, with who made it |
 | `/var/log/mail-dashboard/auth.log` | Dashboard and calendar sign-ins |
+| `/etc/mail-server/settings.json` | Relay, sending limit and alert settings (changed from the dashboard) |
+| `/etc/mail-server/shares.json`, `temp-aliases.json` | Shared mailboxes and throwaway addresses |
+| `/var/lib/mail-server/dmarc/` | Received DMARC reports |
 | `/var/backups/mail-server/` | Nightly backups |
 
 ## Repository layout
@@ -390,8 +524,10 @@ install.sh                   the installer
 mail-server.conf.example     settings template
 bin/mailctl                  management command (Python; installed to /usr/local/sbin)
 bin/mail-backup              backup script (runs nightly from cron)
-bin/mail-server-fix-roundcube
-                             keeps Roundcube working on PHP 8.5 (Ubuntu 26.04)
+bin/mail-dmarc-ingest        reads incoming DMARC reports (run by Postfix)
+bin/mail-server-fix-packages
+                             works around bugs in Ubuntu packages (Roundcube on PHP 8.5,
+                             MTA-STS resolver on Python 3.14)
 dashboard/                   the admin dashboard (Flask, served by gunicorn)
 templates/                   configuration files for every service
 DNS.md                       DNS records explained

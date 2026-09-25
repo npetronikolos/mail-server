@@ -70,6 +70,36 @@ MTA_STS_MODE="enforce"
 # Change it per mailbox later with the dashboard or "mailctl user quota".
 DEFAULT_QUOTA=""
 
+# ---- Outgoing mail through a relay service (optional) ----
+# Use this if your hosting provider blocks outgoing port 25, or to send
+# through a service with an established reputation. Examples:
+#   Brevo:      smtp-relay.brevo.com          RELAY_SPF="include:spf.brevo.com"
+#   Mailgun:    smtp.mailgun.org              RELAY_SPF="include:mailgun.org"
+#   Amazon SES: email-smtp.<region>.amazonaws.com  RELAY_SPF="include:amazonses.com"
+# Leave RELAY_HOST empty to deliver directly. Can be changed later in the
+# dashboard (Delivery page).
+RELAY_HOST=""
+RELAY_PORT="587"
+RELAY_USER=""
+RELAY_PASSWORD=""
+RELAY_SPF=""
+
+# How many messages each user may send per hour. Stops a stolen account from
+# sending mass spam and getting your server blocklisted. 0 = no limit.
+OUTGOING_LIMIT_PER_HOUR="200"
+
+# Where problem alerts and the weekly report go. Empty = LETSENCRYPT_EMAIL
+# (an address outside this server is best, so you hear about outages).
+ALERT_EMAIL=""
+WEEKLY_REPORT="yes"
+
+# Create the DNS records automatically through your DNS provider's API.
+# Supported: cloudflare, digitalocean. The token needs permission to edit DNS
+# for your domain (Cloudflare: "Edit zone DNS" template). Empty = do it by hand.
+# The A record for MAIL_HOSTNAME must still exist before installing.
+DNS_PROVIDER=""
+DNS_API_TOKEN=""
+
 # Configure the UFW firewall (opens SSH + mail + web ports, blocks the rest).
 ENABLE_FIREWALL="yes"
 

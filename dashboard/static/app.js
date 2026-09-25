@@ -15,6 +15,17 @@
     if (msg && !window.confirm(msg)) e.preventDefault();
   });
 
+  // Buttons that need confirming (a form with several buttons).
+  document.addEventListener("click", function (e) {
+    var b = e.target.closest("[data-confirm-click]");
+    if (b && !window.confirm(b.getAttribute("data-confirm-click"))) e.preventDefault();
+  });
+
+  // Selects that apply immediately.
+  document.querySelectorAll("select[data-autosubmit]").forEach(function (sel) {
+    sel.addEventListener("change", function () { sel.form.submit(); });
+  });
+
   // Click to copy.
   document.addEventListener("click", function (e) {
     var el = e.target.closest(".copy");

@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Spam quarantine{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>Spam quarantine</h1><p class="muted">Messages the spam filter put in users' Junk folders. Releasing one moves it to the inbox and teaches the filter it was not spam.</p></div>
+  <div class="row">
+    <input type="search" class="filter" data-filter="#q" placeholder="Search…" aria-label="Search">
+    <form method="get" class="inline"><select name="days" data-autosubmit aria-label="Period">{% for d, l in [('1', 'Last day'), ('7', 'Last 7 days'), ('30', 'Last 30 days')] %}<option value="{{ d }}" {{ 'selected' if d == days }}>{{ l }}</option>{% endfor %}</select></form>
+  </div>
+</header>
+<section class="card">
+  {% if items %}
+  <table id="q">
+    <thead><tr><th>Received</th><th>Mailbox</th><th>From / subject</th><th>Size</th><th></th></tr></thead>
+    <tbody>
+    {% for m in items %}
+      <tr>
+        <td class="nowrap">{{ ago(m.date) }}</td>
+        <td class="nowrap">{{ m.user }}</td>
+        <td class="clip"><strong>{{ m.subject or '(no subject)' }}</strong><br><small class="muted">{{ m.from }}</small></td>
+        <td class="nowrap">{{ human(m.size) }}</td>
+        <td class="actions">
+          <form method="post" action="{{ url_for('quarantine_action') }}" class="inline">
+            <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="user" value="{{ m.user }}"><input type="hidden" name="id" value="{{ m.id }}">
+            <button class="btn small" name="action" value="release">Not spam</button>
+            <button class="btn small danger" name="action" value="delete" data-confirm-click="Delete this message?">Delete</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No spam caught in this period.</p>
+  {% endif %}
+</section>
+{% endblock %}

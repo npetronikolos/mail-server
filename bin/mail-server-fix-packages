@@ -1,0 +1,33 @@
+#!/bin/sh
+# mail-server-fix-packages - work around known bugs in Ubuntu packages.
+#
+# Safe to run any number of times; each fix does nothing when not needed.
+# Runs after every apt/dpkg operation (/etc/apt/apt.conf.d/99mail-server), so
+# a package update that brings the bug back is patched again right away.
+set -eu
+
+# 1. Roundcube 1.6.11 and older define array_first(), which PHP 8.5 (Ubuntu
+#    26.04) now has built in: every page fails with "Cannot redeclare function
+#    array_first()". Wrap Roundcube's copy in function_exists(); both return
+#    the first element of an array.
+f=/usr/share/roundcube/program/lib/Roundcube/bootstrap.php
+if [ -f "$f" ] && grep -q '^function array_first(' "$f" \
+   && ! grep -q 'function_exists("array_first")' "$f" \
+   && php -r 'exit(function_exists("array_first") ? 0 : 1);' 2>/dev/null; then
+  perl -0pi -e 's/^function array_first\(\$array\)\n\{\n(.*?)\n\}\n/if (!function_exists("array_first")) {\nfunction array_first(\$array)\n{\n$1\n}\n}\n/sm' "$f"
+  echo "mail-server: patched Roundcube for PHP 8.5 (array_first)"
+fi
+
+# 2. postfix-mta-sts-resolver 1.5.0 calls asyncio.get_event_loop() before an
+#    event loop exists, which Python 3.14 (Ubuntu 26.04) turned into an error:
+#    the daemon dies at startup and Postfix can no longer send any mail.
+#    Create and register the loop explicitly instead.
+d=/usr/lib/python3/dist-packages/postfix_mta_sts_resolver/daemon.py
+if [ -f "$d" ] && grep -q '^        evloop = asyncio.get_event_loop()$' "$d" \
+   && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)'; then
+  sed -i 's/^        evloop = asyncio.get_event_loop()$/        evloop = asyncio.new_event_loop()\n        asyncio.set_event_loop(evloop)/' "$d"
+  echo "mail-server: patched postfix-mta-sts-resolver for Python 3.14"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl try-restart postfix-mta-sts-resolver >/dev/null 2>&1 || true
+  fi
+fi

@@ -26,7 +26,10 @@
     <a href="{{ url_for('mailboxes') }}" class="{{ 'on' if ep == 'mailboxes' }}">Mailboxes</a>
     <a href="{{ url_for('aliases') }}" class="{{ 'on' if ep == 'aliases' }}">Aliases</a>
     <a href="{{ url_for('queue') }}" class="{{ 'on' if ep == 'queue' }}">Mail queue</a>
+    <a href="{{ url_for('quarantine') }}" class="{{ 'on' if ep == 'quarantine' }}">Spam quarantine</a>
+    <a href="{{ url_for('dmarc') }}" class="{{ 'on' if ep == 'dmarc' }}">DMARC reports</a>
     <div class="navgroup">Operations</div>
+    <a href="{{ url_for('delivery') }}" class="{{ 'on' if ep == 'delivery' }}">Delivery &amp; alerts</a>
     <a href="{{ url_for('security') }}" class="{{ 'on' if ep == 'security' }}">Security</a>
     <a href="{{ url_for('logs') }}" class="{{ 'on' if ep == 'logs' }}">Logs</a>
     <a href="{{ url_for('backups') }}" class="{{ 'on' if ep == 'backups' }}">Backups</a>

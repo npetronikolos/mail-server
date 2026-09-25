@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Delivery & alerts{% endblock %}
+{% block main %}
+<header class="head"><div><h1>Delivery &amp; alerts</h1><p class="muted">How outgoing mail leaves this server, sending limits, problem alerts and DNS automation.</p></div></header>
+
+<div class="grid two">
+<section class="card">
+  <h2>Relay service</h2>
+  {% if relay.enabled %}
+    <p><span class="badge ok">On</span> Outgoing mail goes through <strong>{{ relay.host }}:{{ relay.port }}</strong>{% if relay.user %} as <code>{{ relay.user }}</code>{% endif %}.</p>
+    {% if relay.spf %}<p class="small muted">SPF includes <code>{{ relay.spf }}</code>.</p>{% endif %}
+    <form method="post" action="{{ url_for('delivery_relay') }}" class="row">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn" name="action" value="test">Test connection</button>
+      <button class="btn danger" name="action" value="off" data-confirm-click="Deliver outgoing mail directly again?">Turn off</button>
+    </form>
+  {% else %}
+    <p>Off - this server delivers outgoing mail itself. Use a relay if your provider blocks outgoing port 25, or to send through a service with an established reputation (Brevo, Mailgun, Amazon SES, Postmark…).</p>
+  {% endif %}
+  <details {{ 'open' if not relay.enabled }}>
+    <summary class="btn small">{{ 'Change relay' if relay.enabled else 'Set up a relay' }}</summary>
+    <form method="post" action="{{ url_for('delivery_relay') }}" class="formgrid">
+      <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="action" value="set">
+      <label>Server<input name="host" placeholder="smtp-relay.brevo.com" value="{{ relay.host }}" required></label>
+      <label>Port<select name="port">{% for p in (587, 465, 2525, 25) %}<option {{ 'selected' if p == relay.port }}>{{ p }}</option>{% endfor %}</select></label>
+      <label>User name<input name="user" value="{{ relay.user }}" autocomplete="off"></label>
+      <label>Password / API key<input name="password" type="password" autocomplete="new-password"></label>
+      <label>SPF entry from your provider <small class="muted">(e.g. include:spf.brevo.com)</small><input name="spf" value="{{ relay.spf }}" placeholder="include:…"></label>
+      <button class="btn primary">Save relay</button>
+    </form>
+  </details>
+</section>
+
+<section class="card">
+  <h2>Outgoing limit</h2>
+  <p>Each user may send <strong>{{ limit.per_hour if limit.per_hour else 'unlimited' }}</strong> messages per hour. If a password is stolen, this stops spammers from sending thousands of messages and getting your server blocklisted. You get an alert when someone hits the limit.</p>
+  <form method="post" action="{{ url_for('delivery_limit') }}" class="row">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input name="per_hour" type="number" min="0" max="100000" value="{{ limit.per_hour }}" aria-label="Messages per hour">
+    <span class="muted small">per hour (0 = no limit)</span>
+    <button class="btn">Save</button>
+  </form>
+</section>
+</div>
+
+<div class="grid two">
+<section class="card">
+  <h2>Alerts &amp; weekly report</h2>
+  <p>Every 15 minutes the server checks itself and emails <strong>{{ alerts.recipient }}</strong> about new problems (certificate, blocklists, services, disk, backups, stuck mail, DNS) and when they are fixed.</p>
+  {% if alerts.open %}
+  <p class="small"><span class="badge error">{{ alerts.open|length }} open</span>
+    {% for a in alerts.open[:5] %}<br><small>{{ a.key }}</small>{% endfor %}</p>
+  {% endif %}
+  <form method="post" action="{{ url_for('delivery_alerts') }}" class="formgrid">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="action" value="save">
+    <label>Send alerts to <small class="muted">(best: an address outside this server)</small>
+      <input name="email" type="email" value="{{ alerts.recipient if alerts.custom }}" placeholder="{{ alerts.recipient }}"></label>
+    <label class="check"><input type="checkbox" name="weekly" value="1" {{ 'checked' if alerts.weekly_report }}> Weekly report every Monday (mail volume, spam, health, DMARC, largest mailboxes)</label>
+    <button class="btn">Save</button>
+  </form>
+  <form method="post" action="{{ url_for('delivery_alerts') }}" class="row">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button class="btn small" name="action" value="test">Send a test alert</button>
+    <button class="btn small" name="action" value="report">Send the weekly report now</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>DNS automation</h2>
+  {% if dnsp.connected %}
+    <p><span class="badge ok">Connected</span> {{ dnsp.name }}. On each domain's page, <em>Create records at {{ dnsp.name }}</em> shows the changes and makes them after you confirm.</p>
+    <form method="post" action="{{ url_for('delivery_dns_provider') }}">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn danger" name="action" value="off">Disconnect (delete the token)</button>
+    </form>
+  {% else %}
+    <p>Connect your DNS provider and the server creates all its DNS records for you (MX, SPF, DKIM, DMARC, MTA-STS, auto-setup).</p>
+    <form method="post" action="{{ url_for('delivery_dns_provider') }}" class="formgrid">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label>Provider<select name="provider"><option value="cloudflare">Cloudflare</option><option value="digitalocean">DigitalOcean</option></select></label>
+      <label>API token <small class="muted">(Cloudflare: "Edit zone DNS" template; DigitalOcean: write scope)</small>
+        <input name="token" type="password" autocomplete="off" required></label>
+      <button class="btn primary">Connect</button>
+    </form>
+  {% endif %}
+</section>
+</div>
+{% endblock %}

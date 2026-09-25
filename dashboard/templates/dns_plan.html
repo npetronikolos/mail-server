@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}DNS changes for {{ domain }}{% endblock %}
+{% block main %}
+<header class="head"><div><h1>DNS changes for {{ domain }}</h1><p class="muted">{{ r.provider }} · zone {{ r.zone }}. Nothing has been changed yet.</p></div></header>
+{% set changes = r.plan|selectattr('action', 'in', ['create', 'update', 'delete'])|list %}
+<section class="card">
+  <table>
+    <thead><tr><th>Change</th><th>Type</th><th>Name</th><th>New value</th></tr></thead>
+    <tbody>
+    {% for p in r.plan %}
+      <tr>
+        <td><span class="badge {{ {'create': 'ok', 'update': 'warn', 'delete': 'error', 'keep': '', 'skip': ''}[p.action] }}">{{ {'create': 'add', 'update': 'change', 'delete': 'remove', 'keep': 'already correct', 'skip': 'skipped'}[p.action] }}</span></td>
+        <td><strong>{{ p.type }}</strong></td>
+        <td><code>{{ p.fqdn }}</code></td>
+        <td class="val"><code>{{ p.value }}</code>
+          {% if p.old %}<br><small class="muted">was: {{ p.old }}</small>{% endif %}
+          {% if p.note %}<br><small class="muted">{{ p.note }}</small>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% if changes %}
+{% if r.plan|selectattr('type', 'equalto', 'MX')|selectattr('action', 'in', ['update', 'delete'])|list %}
+<div class="flash warn">This replaces the domain's current MX record: from now on, mail for {{ domain }} is delivered to this server instead of where it goes today.</div>
+{% endif %}
+<form method="post" class="row">
+  <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirm" value="1">
+  <button class="btn primary">Make {{ changes|length }} change{{ 's' if changes|length != 1 }}</button>
+  <a class="btn" href="{{ url_for('domain_view', domain=domain) }}">Cancel</a>
+</form>
+{% else %}
+<p>All records are already correct. <a href="{{ url_for('domain_view', domain=domain) }}">Back</a></p>
+{% endif %}
+{% endblock %}

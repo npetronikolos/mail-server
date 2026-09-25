@@ -125,6 +125,16 @@ preflight() {
   ADMIN_ALLOWED_IPS=${ADMIN_ALLOWED_IPS:-}
   DEFAULT_QUOTA=${DEFAULT_QUOTA:-}
   BACKUP_RSYNC_TARGET=${BACKUP_RSYNC_TARGET:-}
+  RELAY_HOST=${RELAY_HOST:-}
+  RELAY_PORT=${RELAY_PORT:-587}
+  RELAY_USER=${RELAY_USER:-}
+  RELAY_PASSWORD=${RELAY_PASSWORD:-}
+  RELAY_SPF=${RELAY_SPF:-}
+  OUTGOING_LIMIT_PER_HOUR=${OUTGOING_LIMIT_PER_HOUR:-200}
+  ALERT_EMAIL=${ALERT_EMAIL:-}
+  WEEKLY_REPORT=${WEEKLY_REPORT:-yes}
+  DNS_PROVIDER=${DNS_PROVIDER:-}
+  DNS_API_TOKEN=${DNS_API_TOKEN:-}
   ENABLE_CLAMAV=${ENABLE_CLAMAV:-yes}
   ENABLE_WEBMAIL=${ENABLE_WEBMAIL:-yes}
   ENABLE_FIREWALL=${ENABLE_FIREWALL:-yes}
@@ -144,6 +154,9 @@ preflight() {
   [[ $SSH_PORT =~ ^[0-9]+$ ]] || die "SSH_PORT must be a number"
   [[ $MTA_STS_MODE =~ ^(enforce|testing|none)$ ]] || die "MTA_STS_MODE must be enforce, testing or none"
   [[ -z $DEFAULT_QUOTA || $DEFAULT_QUOTA =~ ^[0-9]+[KMGTkmgt]?$ ]] || die "DEFAULT_QUOTA must look like 5G or 500M"
+  [[ $OUTGOING_LIMIT_PER_HOUR =~ ^[0-9]+$ ]] || die "OUTGOING_LIMIT_PER_HOUR must be a number (0 = no limit)"
+  [[ -z $DNS_PROVIDER || $DNS_PROVIDER =~ ^(cloudflare|digitalocean)$ ]] || die "DNS_PROVIDER must be cloudflare or digitalocean"
+  if [[ -n $RELAY_USER && -z $RELAY_PASSWORD ]]; then die "RELAY_USER is set but RELAY_PASSWORD is empty"; fi
   [[ $ENABLE_DAV == yes && $ENABLE_DASHBOARD != yes ]] && die "ENABLE_DAV needs ENABLE_DASHBOARD=yes (it checks the passwords)"
 
   # shellcheck source=/dev/null
@@ -201,8 +214,10 @@ preflight() {
 setup_system() {
   step "Basic system settings"
   install -d -m 755 "$ETC"
-  # Keep a copy for mailctl and the dashboard, minus the admin password.
-  sed 's/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=""/' "$CONF_SRC" >"$ETC/mail-server.conf"
+  # Keep a copy for mailctl and the dashboard, minus the passwords and tokens
+  # (those are stored in root-only files instead).
+  sed -e 's/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=""/' -e 's/^RELAY_PASSWORD=.*/RELAY_PASSWORD=""/' \
+      -e 's/^DNS_API_TOKEN=.*/DNS_API_TOKEN=""/' "$CONF_SRC" >"$ETC/mail-server.conf"
   chmod 640 "$ETC/mail-server.conf"
   touch "$SECRETS"
   chmod 600 "$SECRETS"
@@ -244,13 +259,19 @@ EOF
   fi
 
   apt_install ca-certificates curl openssl cron python3 bind9-dnsutils rsync \
-    postfix postfix-pcre postfix-mta-sts-resolver \
+    postfix postfix-pcre postfix-mta-sts-resolver libsasl2-modules \
     dovecot-core dovecot-imapd dovecot-lmtpd dovecot-sieve dovecot-managesieved \
     rspamd redis-server unbound dns-root-data \
     nginx certbot \
     fail2ban python3-systemd \
     unattended-upgrades
 
+  # Full-text search: Flatcurve is built into Dovecot 2.4; 2.3 uses Xapian.
+  if dpkg --compare-versions "$(dpkg-query -W -f='${Version}' dovecot-core | sed 's/^[0-9]*://')" ge 2.4; then
+    apt_install dovecot-flatcurve
+  else
+    apt_install dovecot-fts-xapian
+  fi
   if [[ $ENABLE_CLAMAV == yes ]]; then
     apt_install clamav-daemon clamav-freshclam
   fi
@@ -272,6 +293,16 @@ EOF
     rm -f /usr/sbin/policy-rc.d
     trap - EXIT
   fi
+
+  # Work around bugs in Ubuntu's packages (Roundcube on PHP 8.5, the MTA-STS
+  # resolver on Python 3.14) now and again after every package update.
+  rm -f /usr/local/sbin/mail-server-fix-roundcube
+  install -m 755 "$SCRIPT_DIR/bin/mail-server-fix-packages" /usr/local/sbin/mail-server-fix-packages
+  cat >/etc/apt/apt.conf.d/99mail-server <<'EOF'
+// Installed by mail-server install.sh
+DPkg::Post-Invoke { "if [ -x /usr/local/sbin/mail-server-fix-packages ]; then /usr/local/sbin/mail-server-fix-packages || true; fi"; };
+EOF
+  /usr/local/sbin/mail-server-fix-packages
 }
 
 setup_vmail_user() {
@@ -435,6 +466,20 @@ setup_postfix() {
     "dnsblog/unix=dnsblog unix - - y - 0 dnsblog" \
     "tlsproxy/unix=tlsproxy unix - - y - 0 tlsproxy"
 
+  # DMARC reports (sent to dmarc-reports@<domain>) are handed to a small
+  # reader instead of a mailbox; the dashboard shows them.
+  if ! id mail-reports >/dev/null 2>&1; then
+    useradd --system --user-group --no-create-home --home-dir /var/lib/mail-server \
+      --shell /usr/sbin/nologin --comment "DMARC report reader" mail-reports
+  fi
+  install -d -m 755 /var/lib/mail-server
+  install -d -o mail-reports -g mail-reports -m 750 /var/lib/mail-server/dmarc
+  install -m 755 "$SCRIPT_DIR/bin/mail-dmarc-ingest" /usr/local/sbin/mail-dmarc-ingest
+  echo "dmarc.invalid dmarc:" >/etc/postfix/transport
+  postmap hash:/etc/postfix/transport
+  postconf -e "transport_maps = hash:/etc/postfix/transport" "dmarc_destination_recipient_limit = 1"
+  postconf -M "dmarc/unix=dmarc unix - n n - - pipe flags=Rq user=mail-reports argv=/usr/local/sbin/mail-dmarc-ingest"
+
   # Outgoing mail: honour the MTA-STS policies of receiving domains
   # (like Gmail and Outlook), so their mail is only sent encrypted.
   systemctl enable postfix-mta-sts-resolver >/dev/null 2>&1 || true
@@ -453,6 +498,7 @@ setup_dovecot() {
   [[ -f /etc/dovecot/dovecot.conf.orig ]] || cp /etc/dovecot/dovecot.conf /etc/dovecot/dovecot.conf.orig
   render "$TEMPLATES/dovecot/$tpl" /etc/dovecot/dovecot.conf 644
 
+  [[ -f /var/vmail/shared-mailboxes.db ]] || install -o vmail -g vmail -m 600 /dev/null /var/vmail/shared-mailboxes.db
   [[ -f /etc/dovecot/users ]] || install -m 640 -o root -g dovecot /dev/null /etc/dovecot/users
   chown root:dovecot /etc/dovecot/users
   chmod 640 /etc/dovecot/users
@@ -606,15 +652,6 @@ setup_webmail() {
     PHP_FPM_SOCK=/run/php/php$php_ver-fpm.sock
     systemctl enable --now "php$php_ver-fpm" >/dev/null
 
-    # Ubuntu 26.04 ships PHP 8.5 with a Roundcube that predates it; patch it
-    # now and again after every package update.
-    install -m 755 "$SCRIPT_DIR/bin/mail-server-fix-roundcube" /usr/local/sbin/mail-server-fix-roundcube
-    cat >/etc/apt/apt.conf.d/99mail-server <<'EOF'
-// Installed by mail-server install.sh
-DPkg::Post-Invoke { "if [ -x /usr/local/sbin/mail-server-fix-roundcube ]; then /usr/local/sbin/mail-server-fix-roundcube || true; fi"; };
-EOF
-    /usr/local/sbin/mail-server-fix-roundcube
-
     ROUNDCUBE_DES_KEY=$(get_secret ROUNDCUBE_DES_KEY random_string 24)
     ROUNDCUBE_VERIFY_TLS=true
     [[ $CERT_MODE == selfsigned ]] && ROUNDCUBE_VERIFY_TLS=false
@@ -677,6 +714,16 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Nightly backup of mail, configuration and keys
 30 3 * * * root /usr/local/sbin/mail-backup >/dev/null
 EOF
+  cat >>/etc/cron.d/mail-server <<'EOF'
+# Health checks every 15 minutes; emails the admin about new problems
+*/15 * * * * root /usr/local/sbin/mailctl alerts run >/dev/null 2>&1
+# Weekly report, Monday morning
+43 7 * * 1 root /usr/local/sbin/mailctl report >/dev/null 2>&1
+# Remove expired throwaway addresses
+7 * * * * root /usr/local/sbin/mailctl alias temp expire >/dev/null 2>&1
+# Share newly created folders of shared mailboxes
+20 2 * * * root /usr/local/sbin/mailctl share sync >/dev/null 2>&1
+EOF
   if [[ $CERT_MODE == letsencrypt ]]; then
     # Add mta-sts/autoconfig/autodiscover names to the certificate once their
     # DNS points here (does nothing when nothing changed).
@@ -702,6 +749,23 @@ start_services() {
   wait_port 11332 rspamd
   wait_port 993 dovecot
   wait_port 25 postfix
+
+  # Postfix asks the MTA-STS resolver before every outgoing delivery; if it
+  # does not answer, no mail goes out at all. Better to send without MTA-STS
+  # checks than not to send.
+  local i ok=no
+  for ((i = 0; i < 15; i++)); do
+    if ! postmap -q "$DOMAIN" socketmap:inet:127.0.0.1:8461:postfix 2>&1 | grep -q fatal; then
+      ok=yes
+      break
+    fi
+    sleep 1
+  done
+  if [[ $ok == no ]]; then
+    warn "the MTA-STS resolver does not answer; outgoing MTA-STS checks are switched off (mail still goes out)."
+    postconf -X smtp_tls_policy_maps
+    systemctl reload postfix
+  fi
 }
 
 setup_accounts() {
@@ -733,6 +797,29 @@ setup_accounts() {
   # already point here (more are added daily by cron as DNS appears).
   if [[ $CERT_MODE == letsencrypt ]]; then
     mailctl cert >/dev/null 2>&1 || warn "could not extend the certificate; run 'mailctl cert' later"
+  fi
+
+  # Settings from mail-server.conf are applied the first time; after that the
+  # dashboard (or mailctl) owns them.
+  local settings=$ETC/settings.json
+  if ! grep -q '"outgoing_limit"' "$settings" 2>/dev/null; then
+    mailctl limit set "$OUTGOING_LIMIT_PER_HOUR" >/dev/null
+  fi
+  if [[ -n $ALERT_EMAIL || $WEEKLY_REPORT != yes ]] && ! grep -q '"weekly_report"' "$settings" 2>/dev/null; then
+    mailctl alerts config --email "$ALERT_EMAIL" --weekly "$WEEKLY_REPORT" >/dev/null
+  fi
+  if [[ -n $RELAY_HOST ]] && ! grep -q '"relay"' "$settings" 2>/dev/null; then
+    local relay_args=(relay set "$RELAY_HOST" --port "$RELAY_PORT")
+    [[ -n $RELAY_USER ]] && relay_args+=(--user "$RELAY_USER")
+    [[ -n $RELAY_SPF ]] && relay_args+=(--spf "$RELAY_SPF")
+    printf '%s\n' "$RELAY_PASSWORD" | mailctl "${relay_args[@]}" >/dev/null
+  fi
+  if [[ -n $DNS_PROVIDER && -n $DNS_API_TOKEN && ! -f $ETC/dns-api.json ]]; then
+    if printf '%s\n' "$DNS_API_TOKEN" | mailctl dns provider set "$DNS_PROVIDER" >/dev/null; then
+      mailctl dns apply "$DOMAIN" --yes || warn "could not create all DNS records; see the dashboard's Domains page"
+    else
+      warn "could not connect to $DNS_PROVIDER with DNS_API_TOKEN; add the records by hand (see DNS.md)"
+    fi
   fi
 
   # System mail for root goes to the administrator.

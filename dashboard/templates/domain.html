@@ -3,8 +3,19 @@
 {% block main %}
 <header class="head">
   <div><h1>{{ domain }}</h1><p class="muted">Create these records at your DNS provider. The status column checks the live DNS.</p></div>
-  <a class="btn" href="{{ url_for('domains') }}">All domains</a>
+  <div class="row">
+    {% if dnsp.connected %}
+    <form method="post" action="{{ url_for('domain_dns_apply', domain=domain) }}" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn primary">Create records at {{ dnsp.name }}…</button>
+    </form>
+    {% endif %}
+    <a class="btn" href="{{ url_for('domains') }}">All domains</a>
+  </div>
 </header>
+{% if not dnsp.connected %}
+<p class="muted small">Tip: connect Cloudflare or DigitalOcean on the <a href="{{ url_for('delivery') }}">Delivery &amp; alerts</a> page and these records are created for you.</p>
+{% endif %}
 <section class="card">
   <table class="dns" id="dns" data-src="{{ url_for('api_dns', domain=domain) }}">
     <thead><tr><th>Status</th><th>Type</th><th>Name</th><th>Value</th><th>Purpose</th></tr></thead>
