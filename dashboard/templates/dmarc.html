@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}DMARC reports{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>DMARC reports</h1><p class="muted">Gmail, Outlook, Yahoo and others report daily who sent mail using your domains, and whether it passed SPF/DKIM.</p></div>
+  <form method="get" class="inline"><select name="days" data-autosubmit aria-label="Period">{% for d in ('7', '30', '90') %}<option value="{{ d }}" {{ 'selected' if d == days }}>Last {{ d }} days</option>{% endfor %}</select></form>
+</header>
+{% for d in r.domains %}
+<section class="card">
+  <h2>{{ d.domain }}</h2>
+  <section class="stats small-stats">
+    <div class="stat"><span>Messages reported</span><strong>{{ d.messages }}</strong></div>
+    <div class="stat"><span>Passed</span><strong>{{ d.messages - d.failed }}</strong></div>
+    <div class="stat {{ 'alert' if d.failed }}"><span>Failed</span><strong>{{ d.failed }}</strong></div>
+    <div class="stat {{ 'alert' if d.foreign_failed }}"><span>Failed, from other servers</span><strong>{{ d.foreign_failed }}</strong></div>
+  </section>
+  <p class="muted small">{{ d.reports }} report{{ 's' if d.reports != 1 }} from {{ d.reporters|join(', ') }}.</p>
+  <table>
+    <thead><tr><th>Sending server</th><th>From header</th><th>Messages</th><th>Result</th><th>What receivers did</th></tr></thead>
+    <tbody>
+    {% for x in d.sources %}
+      <tr>
+        <td><code>{{ x.ip }}</code>{% if x.own %} <span class="badge ok">this server</span>{% endif %}</td>
+        <td>{{ x.header_from }}</td>
+        <td>{{ x.messages }}</td>
+        <td>{% if x.failed == 0 %}<span class="badge ok">passed</span>{% elif x.passed == 0 %}<span class="badge error">failed</span>{% else %}<span class="badge warn">{{ x.failed }} failed</span>{% endif %}</td>
+        <td class="small muted">{% for k, v in x.dispositions.items() %}{{ {'none': 'delivered', 'quarantine': 'sent to spam', 'reject': 'rejected'}.get(k, k) }}: {{ v }}{{ ', ' if not loop.last }}{% endfor %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted small">Failures from other servers are either someone forging your domain (DMARC protects you) or a service you use to send mail (newsletter tool, invoicing, website) that still needs to be added to SPF/DKIM.</p>
+</section>
+{% else %}
+<section class="card"><p class="empty">No DMARC reports yet. They arrive daily once your <code>_dmarc</code> DNS record points to <code>dmarc-reports@</code> your domain (see Domains &amp; DNS).</p></section>
+{% endfor %}
+{% endblock %}

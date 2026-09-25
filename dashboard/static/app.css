@@ -197,3 +197,10 @@ dl.kv dd { margin: 0; }
 @media (max-width: 900px) { .shell { background: none; } }
 .dns td:nth-child(3) code { white-space: nowrap; }
 .dns tr.warn .note { color: var(--warn); }
+
+textarea { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .5rem .7rem; resize: vertical; }
+textarea:focus { outline: 2px solid var(--brand); border-color: transparent; }
+.small-stats { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.small-stats .stat strong { font-size: 1.5rem; }
+details > summary.btn { display: inline-flex; margin-bottom: .6rem; }
+.row input[name=note] { flex: 1; min-width: 200px; }

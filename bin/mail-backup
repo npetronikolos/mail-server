@@ -27,6 +27,7 @@ paths=(
   /var/lib/dbconfig-common/sqlite3/roundcube
   /var/lib/radicale
   /var/lib/mail-dashboard
+  /var/lib/mail-server
   /var/vmail
 )
 existing=()

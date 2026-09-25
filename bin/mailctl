@@ -32,6 +32,7 @@ DKIM_DIR = "/var/lib/rspamd/dkim"
 VMAIL_DIR = "/var/vmail"
 MTA_STS_FILE = "/var/www/mail-autoconfig/mta-sts.txt"
 LOCK_FILE = "/run/mailctl.lock"
+DMARC_ADDRESS = "reports@dmarc.invalid"   # routed to the DMARC report reader
 
 EMAIL_RE = re.compile(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$")
 DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$")
@@ -205,6 +206,8 @@ def rebuild_sender_login():
         owners.setdefault(k, []).append(k)
     for k, v in read_map(VALIASES):
         owners.setdefault(k, []).extend(x for x in v.split(",") if x)
+    for mailbox, members in read_json(SHARES_FILE, {}).items():
+        owners.setdefault(mailbox, []).extend(members)
     rows = sorted((k, ",".join(dict.fromkeys(v))) for k, v in owners.items())
     write_file(SENDER_LOGIN, "".join(f"{k} {v}\n" for k, v in rows), mode=0o644)
 
@@ -408,6 +411,7 @@ def user_del(email, purge=False):
     admins = read_admins()
     if email in admins:
         write_admins([a for a in admins if a != email])
+    forget_user(email)
     d = os.path.join(VMAIL_DIR, domain_of(email), email.split("@")[0])
     if purge:
         shutil.rmtree(d, ignore_errors=True)
@@ -479,6 +483,9 @@ def alias_del(alias):
         raise Fail(f"no such alias: {alias or '<none>'}")
     write_map(VALIASES, [r for r in read_map(VALIASES) if r[0] != alias])
     postmap_all()
+    temps = read_json(TEMP_FILE, {})
+    if temps.pop(alias, None) is not None:
+        write_json(TEMP_FILE, temps, group="mail-dashboard")
     audit(f"alias del {alias}")
     info(f"removed alias {alias}")
     return {"alias": alias}
@@ -527,6 +534,9 @@ def domain_add(domain):
         a = f"{role}@{domain}"
         if a not in users and a not in keys and C.get("ADMIN_EMAIL"):
             aliases.append((a, C["ADMIN_EMAIL"]))
+    # DMARC aggregate reports are read by the dashboard, not a person.
+    if f"dmarc-reports@{domain}" not in users and f"dmarc-reports@{domain}" not in keys:
+        aliases.append((f"dmarc-reports@{domain}", DMARC_ADDRESS))
     write_map(VALIASES, aliases)
     # Rspamd reads the key file when it signs, so no reload is needed.
     postmap_all()
@@ -589,12 +599,14 @@ def dns_records(domain=None):
         if C.get("SERVER_IPV6"):
             add("AAAA", host + ".", C["SERVER_IPV6"], "Mail server (IPv6)", fqdn=host)
     add("MX", "@", f"10 {host}.", "Mail for this domain goes to this server")
-    add("TXT", "@", "v=spf1 mx -all", "SPF: only this server may send for the domain")
+    relay_spf = (load_settings().get("relay") or {}).get("spf", "")
+    add("TXT", "@", f"v=spf1 mx {relay_spf + ' ' if relay_spf else ''}-all",
+        "SPF: only this server (and your relay service) may send for the domain")
     pub = dkim_public(domain)
     if pub:
         add("TXT", f"{C['DKIM_SELECTOR']}._domainkey", f"v=DKIM1; k=rsa; p={pub}",
             "DKIM: proves mail really came from you")
-    add("TXT", "_dmarc", f"v=DMARC1; p=quarantine; rua=mailto:postmaster@{domain}; adkim=r; aspf=r",
+    add("TXT", "_dmarc", f"v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@{domain}; adkim=r; aspf=r",
         "DMARC: tells receivers what to do with forged mail")
     if C.get("ENABLE_MTA_STS") == "yes":
         add("CNAME", "mta-sts", f"{host}.", "MTA-STS policy host", required=False)
@@ -835,12 +847,26 @@ def checks(include_dns=True):
                 add("Network", f"port {port} ({name})", "ok", "listening")
         except OSError:
             add("Network", f"port {port} ({name})", "error", "not listening")
-    out25 = port25_out()
-    add("Network", "outgoing port 25", "ok" if out25 else "error",
-        "can reach other mail servers" if out25
-        else "blocked - ask your hosting provider to open outbound port 25")
+    relay = relay_status()
+    if relay["enabled"]:
+        try:
+            with socket.create_connection((relay["host"], relay["port"]), timeout=8):
+                add("Network", "relay service", "ok", f"{relay['host']}:{relay['port']} reachable")
+        except OSError:
+            add("Network", "relay service", "error", f"cannot reach {relay['host']}:{relay['port']}")
+    else:
+        out25 = port25_out()
+        add("Network", "outgoing port 25", "ok" if out25 else "error",
+            "can reach other mail servers" if out25
+            else "blocked - ask your hosting provider to open outbound port 25, or use a relay service")
     s, d = blocklist_check()
     add("Network", f"IP {C['SERVER_IPV4']} reputation", s, d)
+    if run(["postconf", "-h", "smtp_tls_policy_maps"], check=False).stdout.strip():
+        p = run(["postmap", "-q", C["DOMAIN"], "socketmap:inet:127.0.0.1:8461:postfix"], check=False, timeout=20)
+        broken = "fatal" in (p.stderr + p.stdout)
+        add("Mail", "MTA-STS resolver", "error" if broken else "ok",
+            "not answering - outgoing mail is stuck (systemctl restart postfix-mta-sts-resolver)"
+            if broken else "answering")
 
     cert = st["certificate"]
     if not cert:
@@ -1062,7 +1088,1018 @@ def migrate():
     """Rewrite the users file for the installed Dovecot version (after upgrades)."""
     if os.path.exists(USERS_FILE):
         write_users(read_users())
+    aliases = read_map(VALIASES)
+    keys = {k for k, _ in aliases}
+    added = [(f"dmarc-reports@{d}", DMARC_ADDRESS) for d, _ in read_map(VDOMAINS)
+             if f"dmarc-reports@{d}" not in keys]
+    if added:
+        write_map(VALIASES, aliases + added)
+        postmap_all()
     return {}
+
+
+# ------------------------------------------------------------------ settings
+
+SETTINGS_FILE = "/etc/mail-server/settings.json"
+SASL_PASSWD = "/etc/postfix/sasl_passwd"
+RATELIMIT_CONF = "/etc/rspamd/local.d/ratelimit.conf"
+TEMP_FILE = "/etc/mail-server/temp-aliases.json"
+SHARES_FILE = "/etc/mail-server/shares.json"
+STATE_DIR = "/var/lib/mail-server"
+HOST_RE = re.compile(r"^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$")
+SPF_TERM_RE = re.compile(r"^(include:[a-z0-9._-]+|ip4:[0-9./]+|ip6:[0-9a-f:./]+|a:[a-z0-9._-]+|mx:[a-z0-9._-]+)$")
+UID_RE = re.compile(r"^[0-9]{1,10}$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data, mode=0o640, group=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_file(path, json.dumps(data, indent=2, sort_keys=True) + "\n", mode=mode,
+               like=path if os.path.exists(path) else None)
+    if group:
+        try:
+            shutil.chown(path, "root", group)
+        except (LookupError, OSError):
+            pass
+
+
+def load_settings():
+    return read_json(SETTINGS_FILE, {})
+
+
+def save_settings(s):
+    write_json(SETTINGS_FILE, s, group="mail-dashboard")
+
+
+# ------------------------------------------------------------------ relay (smarthost)
+
+def relay_status():
+    r = load_settings().get("relay") or {}
+    return {"enabled": bool(r.get("host")), "host": r.get("host", ""), "port": r.get("port", 587),
+            "user": r.get("user", ""), "spf": r.get("spf", "")}
+
+
+def normalize_spf(spf):
+    terms = (spf or "").strip().lower().split()
+    for t in terms:
+        if not SPF_TERM_RE.match(t):
+            raise Fail(f"invalid SPF entry '{t}' (use e.g. include:spf.brevo.com)")
+    return " ".join(terms)
+
+
+def relay_set(host, port=587, user="", spf=""):
+    host = (host or "").strip().lower()
+    if not HOST_RE.match(host):
+        raise Fail(f"invalid relay host: {host or '<none>'}")
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        raise Fail("port must be a number")
+    if port not in (25, 465, 587, 2525):
+        raise Fail("port must be 25, 465, 587 or 2525")
+    user = (user or "").strip()
+    if user and not re.fullmatch(r"[^\s:]{1,200}", user):
+        raise Fail("invalid relay user name")
+    spf = normalize_spf(spf)
+    params = [f"relayhost = [{host}]:{port}",
+              "smtp_tls_security_level = encrypt",
+              f"smtp_tls_wrappermode = {'yes' if port == 465 else 'no'}"]
+    if user:
+        pw = sys.stdin.readline().rstrip("\n") if not sys.stdin.isatty() else getpass.getpass("Relay password: ")
+        if not pw:
+            raise Fail("the relay password is empty")
+        fd = os.open(SASL_PASSWD + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(f"[{host}]:{port} {user}:{pw}\n")
+        os.replace(SASL_PASSWD + ".tmp", SASL_PASSWD)
+        run(["postmap", f"hash:{SASL_PASSWD}"])
+        os.chmod(SASL_PASSWD + ".db", 0o600)
+        params += ["smtp_sasl_auth_enable = yes",
+                   f"smtp_sasl_password_maps = hash:{SASL_PASSWD}",
+                   "smtp_sasl_security_options = noanonymous",
+                   "smtp_sasl_tls_security_options = noanonymous"]
+    else:
+        run(["postconf", "-X", "smtp_sasl_auth_enable", "smtp_sasl_password_maps"], check=False)
+    run(["postconf", "-e"] + params)
+    run(["postfix", "reload"], check=False)
+    s = load_settings()
+    s["relay"] = {"host": host, "port": port, "user": user, "spf": spf}
+    save_settings(s)
+    audit(f"relay set {host}:{port} user={user or '-'}")
+    info(f"outgoing mail now goes through {host}:{port}")
+    return relay_status()
+
+
+def relay_off():
+    run(["postconf", "-X", "relayhost", "smtp_sasl_auth_enable", "smtp_sasl_password_maps",
+         "smtp_sasl_security_options", "smtp_sasl_tls_security_options", "smtp_tls_wrappermode"],
+        check=False)
+    run(["postconf", "-e", "smtp_tls_security_level = may"])
+    for f in (SASL_PASSWD, SASL_PASSWD + ".db"):
+        if os.path.exists(f):
+            os.remove(f)
+    run(["postfix", "reload"], check=False)
+    s = load_settings()
+    s.pop("relay", None)
+    save_settings(s)
+    audit("relay off")
+    info("outgoing mail is delivered directly again")
+    return relay_status()
+
+
+def relay_test():
+    """Connect to the relay and log in, without sending anything."""
+    import smtplib
+    import ssl as _ssl
+    r = relay_status()
+    if not r["enabled"]:
+        raise Fail("no relay is configured")
+    pw = None
+    try:
+        with open(SASL_PASSWD) as f:
+            pw = f.read().split(None, 1)[1].strip().split(":", 1)[1]
+    except (OSError, IndexError):
+        pass
+    ctx = _ssl.create_default_context()
+    try:
+        if r["port"] == 465:
+            s = smtplib.SMTP_SSL(r["host"], 465, timeout=20, context=ctx)
+        else:
+            s = smtplib.SMTP(r["host"], r["port"], timeout=20)
+            s.ehlo()
+            s.starttls(context=ctx)
+            s.ehlo()
+        if r["user"]:
+            s.login(r["user"], pw or "")
+        s.quit()
+    except (OSError, smtplib.SMTPException) as e:
+        raise Fail(f"relay test failed: {e}")
+    info(f"connected to {r['host']}:{r['port']} and logged in")
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ outgoing limit
+
+def limit_status():
+    return {"per_hour": int(load_settings().get("outgoing_limit", 0) or 0)}
+
+
+def limit_set(n):
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        raise Fail("the limit must be a number (0 = no limit)")
+    if n < 0 or n > 100000:
+        raise Fail("the limit must be between 0 and 100000")
+    text = "# Managed by mailctl: messages each user may send per hour (0 = no limit).\n"
+    if n:
+        text += ("rates {\n  user = {\n    bucket = {\n"
+                 f"      burst = {n};\n      rate = \"{n} / 1h\";\n"
+                 "    }\n  }\n}\n")
+    write_file(RATELIMIT_CONF, text, mode=0o640, like=RATELIMIT_CONF if os.path.exists(RATELIMIT_CONF) else None)
+    try:
+        shutil.chown(RATELIMIT_CONF, "root", "_rspamd")
+    except (LookupError, OSError):
+        pass
+    run(["systemctl", "reload", "rspamd"], check=False)
+    s = load_settings()
+    s["outgoing_limit"] = n
+    save_settings(s)
+    audit(f"limit set {n}/h")
+    info(f"outgoing limit: {n} messages per user per hour" if n else "outgoing limit removed")
+    return limit_status()
+
+
+# ------------------------------------------------------------------ forwarding & vacation
+
+def user_home(email):
+    return os.path.join(VMAIL_DIR, domain_of(email), email.split("@")[0])
+
+
+def sieve_str(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def rules_get(email):
+    email = lower_email(email)
+    if not find_user(read_users(), email):
+        raise Fail(f"no such mailbox: {email}")
+    r = read_json(os.path.join(user_home(email), "dashboard-rules.json"), {})
+    return {"email": email, "forward": r.get("forward"), "vacation": r.get("vacation")}
+
+
+def rules_save(email, forward, vacation):
+    home = user_home(email)
+    os.makedirs(home, exist_ok=True)
+    shutil.chown(home, "vmail", "vmail")
+    rules = {"forward": forward, "vacation": vacation}
+    path = os.path.join(home, "dashboard-rules.json")
+    write_file(path, json.dumps(rules, indent=2) + "\n", mode=0o600)
+    shutil.chown(path, "vmail", "vmail")
+    sieve = os.path.join(home, "dashboard.sieve")
+    for old in (sieve, sieve[:-6] + ".svbin"):
+        if os.path.exists(old):
+            os.remove(old)
+    if not forward and not vacation:
+        return
+    need = {"copy"} if forward and forward.get("keep") else set()
+    body = []
+    if vacation:
+        need |= {"vacation"}
+        cond = []
+        if vacation.get("start"):
+            cond.append(f'currentdate :value "ge" "date" {sieve_str(vacation["start"])}')
+        if vacation.get("end"):
+            cond.append(f'currentdate :value "le" "date" {sieve_str(vacation["end"])}')
+        if cond:
+            need |= {"date", "relational"}
+        addrs = [email] + [a["alias"] for a in alias_list()
+                           if email in a["destinations"] and not a["alias"].startswith("@")]
+        stmt = (f"vacation :days 3 :subject {sieve_str(vacation.get('subject') or 'Out of office')} "
+                f":addresses [{', '.join(sieve_str(a) for a in addrs)}] {sieve_str(vacation['message'])};")
+        body.append(f"  if allof({', '.join(cond)}) {{\n    {stmt}\n  }}" if cond else f"  {stmt}")
+    if forward:
+        cp = ":copy " if forward.get("keep") else ""
+        body += [f"  redirect {cp}{sieve_str(t)};" for t in forward["to"]]
+    text = ("# Managed by the mail dashboard (mailctl user forward / vacation). Do not edit.\n"
+            f"require [{', '.join(sieve_str(x) for x in sorted(need))}];\n\n"
+            "# Never forward or auto-reply to spam.\n"
+            'if not header :contains "X-Spam" "Yes" {\n' + "\n".join(body) + "\n}\n")
+    write_file(sieve, text, mode=0o600)
+    shutil.chown(sieve, "vmail", "vmail")
+    p = run(["runuser", "-u", "vmail", "--", "sievec", sieve], check=False)
+    if p.returncode != 0:
+        os.remove(sieve)
+        raise Fail(f"could not build the filter: {(p.stderr or p.stdout).strip()[:200]}")
+
+
+def user_forward(email, to=None, keep=True, off=False):
+    r = rules_get(email)
+    email = r["email"]
+    if off:
+        fwd = None
+    else:
+        targets = [lower_email(t, "forwarding address") for t in re.split(r"[,\s]+", to or "") if t]
+        targets = list(dict.fromkeys(targets))
+        if not targets:
+            raise Fail("give at least one address to forward to")
+        if len(targets) > 4:
+            raise Fail("at most 4 forwarding addresses")
+        if email in targets:
+            raise Fail("a mailbox cannot forward to itself")
+        fwd = {"to": targets, "keep": bool(keep)}
+    rules_save(email, fwd, r["vacation"])
+    audit(f"user forward {email} " + ("off" if off else f"-> {','.join(fwd['to'])} keep={fwd['keep']}"))
+    info(f"forwarding for {email}: " + ("off" if off else ", ".join(fwd["to"])))
+    return rules_get(email)
+
+
+def user_vacation(email, subject="", start="", end="", off=False):
+    r = rules_get(email)
+    email = r["email"]
+    if off:
+        vac = None
+    else:
+        message = sys.stdin.read() if not sys.stdin.isatty() else input("Message: ")
+        message = message.strip()
+        if not message:
+            raise Fail("the vacation message is empty")
+        if len(message) > 5000 or len(subject or "") > 200:
+            raise Fail("the vacation message or subject is too long")
+        for d in (start, end):
+            if d and not DATE_RE.match(d):
+                raise Fail(f"invalid date '{d}' (use YYYY-MM-DD)")
+        if start and end and end < start:
+            raise Fail("the end date is before the start date")
+        vac = {"subject": (subject or "Out of office").strip(), "message": message,
+               "start": start or "", "end": end or ""}
+    rules_save(email, r["forward"], vac)
+    audit(f"user vacation {email} " + ("off" if off else f"{start or '-'}..{end or '-'}"))
+    info(f"vacation reply for {email}: " + ("off" if off else "on"))
+    return rules_get(email)
+
+
+# ------------------------------------------------------------------ throwaway addresses
+
+def temp_load():
+    return read_json(TEMP_FILE, {})
+
+
+def temp_add(owner, days=None, note=""):
+    import secrets as _secrets
+    owner = lower_email(owner)
+    if not find_user(read_users(), owner):
+        raise Fail(f"no such mailbox: {owner}")
+    data = temp_load()
+    if sum(1 for v in data.values() if v["owner"] == owner) >= 50:
+        raise Fail("at most 50 throwaway addresses per mailbox")
+    expires = None
+    if days not in (None, "", "0", 0):
+        try:
+            d = int(days)
+        except ValueError:
+            raise Fail("days must be a number")
+        if not 1 <= d <= 3650:
+            raise Fail("days must be between 1 and 3650")
+        expires = (datetime.datetime.now() + datetime.timedelta(days=d)).isoformat(timespec="seconds")
+    existing = map_keys(VALIASES) | {u["email"] for u in read_users()}
+    alphabet = "abcdefghijkmnpqrstuvwxyz23456789"
+    while True:
+        alias = "".join(_secrets.choice(alphabet) for _ in range(10)) + "@" + domain_of(owner)
+        if alias not in existing:
+            break
+    alias_add(alias, owner)
+    data[alias] = {"owner": owner, "created": datetime.datetime.now().isoformat(timespec="seconds"),
+                   "expires": expires, "note": (note or "")[:100]}
+    write_json(TEMP_FILE, data, group="mail-dashboard")
+    info(f"throwaway address {alias} -> {owner}" + (f" (until {expires[:10]})" if expires else ""))
+    return dict(data[alias], alias=alias)
+
+
+def temp_list(owner=None):
+    out = [dict(v, alias=k) for k, v in temp_load().items() if not owner or v["owner"] == owner]
+    return sorted(out, key=lambda x: x["created"], reverse=True)
+
+
+def temp_del(alias, owner=None):
+    alias = (alias or "").strip().lower()
+    data = temp_load()
+    if alias not in data or (owner and data[alias]["owner"] != owner.lower()):
+        raise Fail(f"no such throwaway address: {alias}")
+    if alias in map_keys(VALIASES):
+        alias_del(alias)
+    data.pop(alias, None)
+    write_json(TEMP_FILE, data, group="mail-dashboard")
+    return {"alias": alias}
+
+
+def temp_expire():
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    gone = [k for k, v in temp_load().items() if v.get("expires") and v["expires"] < now]
+    for alias in gone:
+        temp_del(alias)
+    return {"expired": gone}
+
+
+# ------------------------------------------------------------------ shared mailboxes
+
+SHARE_RIGHTS = ["lookup", "read", "write", "write-seen", "write-deleted", "insert", "post",
+                "expunge", "create"]
+
+
+def shares_load():
+    return read_json(SHARES_FILE, {})
+
+
+def mailbox_folders(email):
+    p = run(["doveadm", "mailbox", "list", "-u", email], check=False)
+    return [x.strip() for x in p.stdout.splitlines() if x.strip() and not x.startswith("Shared")]
+
+
+def share_apply(mailbox, member, grant=True):
+    for folder in mailbox_folders(mailbox):
+        if grant:
+            run(["doveadm", "acl", "set", "-u", mailbox, folder, f"user={member}"] + SHARE_RIGHTS, check=False)
+        else:
+            run(["doveadm", "acl", "delete", "-u", mailbox, folder, f"user={member}"], check=False)
+    run(["doveadm", "acl", "recalc", "-u", mailbox], check=False)
+
+
+def share_add(mailbox, member):
+    mailbox, member = lower_email(mailbox), lower_email(member)
+    users = read_users()
+    for e in (mailbox, member):
+        if not find_user(users, e):
+            raise Fail(f"no such mailbox: {e}")
+    if mailbox == member:
+        raise Fail("a mailbox is always shared with itself")
+    data = shares_load()
+    members = data.setdefault(mailbox, [])
+    if member not in members:
+        members.append(member)
+    share_apply(mailbox, member, True)
+    write_json(SHARES_FILE, data, group="mail-dashboard")
+    postmap_all()
+    audit(f"share {mailbox} with {member}")
+    info(f"{member} can now read {mailbox} (Shared/{mailbox}/ in their mail app) and send as it")
+    return {"mailbox": mailbox, "members": members}
+
+
+def share_del(mailbox, member):
+    mailbox, member = lower_email(mailbox), lower_email(member)
+    data = shares_load()
+    if member not in data.get(mailbox, []):
+        raise Fail(f"{mailbox} is not shared with {member}")
+    data[mailbox].remove(member)
+    if not data[mailbox]:
+        del data[mailbox]
+    share_apply(mailbox, member, False)
+    write_json(SHARES_FILE, data, group="mail-dashboard")
+    postmap_all()
+    audit(f"unshare {mailbox} from {member}")
+    info(f"{member} no longer has access to {mailbox}")
+    return {"mailbox": mailbox, "members": data.get(mailbox, [])}
+
+
+def share_sync():
+    """Re-apply sharing to folders created since (run nightly)."""
+    for mailbox, members in shares_load().items():
+        for m in members:
+            share_apply(mailbox, m, True)
+    return shares_load()
+
+
+def forget_user(email):
+    """Remove a deleted mailbox from shares and throwaway addresses."""
+    data = shares_load()
+    changed = False
+    for mb in list(data):
+        if mb == email:
+            del data[mb]
+            changed = True
+        elif email in data[mb]:
+            data[mb].remove(email)
+            changed = True
+            if not data[mb]:
+                del data[mb]
+    if changed:
+        write_json(SHARES_FILE, data, group="mail-dashboard")
+    for alias in [k for k, v in temp_load().items() if v["owner"] == email]:
+        temp_del(alias)
+
+
+# ------------------------------------------------------------------ Junk quarantine & search
+
+def junk_list(user=None, days=30, limit=300):
+    users = [lower_email(user)] if user else [u["email"] for u in read_users()]
+    since = (datetime.date.today() - datetime.timedelta(days=int(days))).isoformat()
+    out = []
+    for u in users:
+        p = run(["doveadm", "-f", "json", "fetch", "-u", u,
+                 "uid date.received size.virtual hdr.from hdr.subject",
+                 "mailbox", "Junk", "SINCE", since], check=False, timeout=120)
+        try:
+            rows = json.loads(p.stdout or "[]")
+        except ValueError:
+            rows = []
+        for r in rows:
+            out.append({"user": u, "id": r.get("uid"), "date": r.get("date.received"),
+                        "size": int(r.get("size.virtual") or 0),
+                        "from": (r.get("hdr.from") or "").strip()[:200],
+                        "subject": (r.get("hdr.subject") or "").strip()[:200]})
+    out.sort(key=lambda x: x["date"] or "", reverse=True)
+    return out[:int(limit)]
+
+
+def junk_action(action, user, uid):
+    """uid: the message's number in the user's Junk folder."""
+    user = lower_email(user)
+    if not UID_RE.match(str(uid or "")):
+        raise Fail("invalid message id")
+    if not find_user(read_users(), user):
+        raise Fail(f"no such mailbox: {user}")
+    if action == "release":
+        # Teach the spam filter that this was not spam, then move it to INBOX.
+        p = subprocess.run(["doveadm", "fetch", "-u", user, "text", "mailbox", "Junk", "uid", str(uid)],
+                           capture_output=True, timeout=60)
+        raw = p.stdout
+        if raw.startswith(b"text:"):
+            raw = raw[5:].lstrip(b"\n")
+        if raw.strip():
+            subprocess.run(["rspamc", "-h", "127.0.0.1:11334", "learn_ham"], input=raw,
+                           capture_output=True, timeout=60)
+        run(["doveadm", "move", "-u", user, "INBOX", "mailbox", "Junk", "uid", str(uid)])
+    elif action == "delete":
+        run(["doveadm", "expunge", "-u", user, "mailbox", "Junk", "uid", str(uid)])
+    else:
+        raise Fail(f"unknown action: {action}")
+    audit(f"junk {action} {user} {uid}")
+    info("message " + ("moved to INBOX" if action == "release" else "deleted"))
+    return {"action": action, "user": user, "id": uid}
+
+
+def search_rebuild(user=None):
+    target = ["-u", lower_email(user)] if user else ["-A"]
+    run(["doveadm", "fts", "rescan"] + target, check=False, timeout=600)
+    run(["doveadm", "index"] + target + ["-q", "*"], check=False, timeout=600)
+    audit("search rebuild " + (user or "all"))
+    info("search index rebuild queued")
+    return {"queued": True}
+
+
+# ------------------------------------------------------------------ alerts & weekly report
+
+ALERT_STATE = "/var/lib/mail-server/alerts.json"
+ALERT_WARN_NAMES = {"TLS certificate", "disk space", "memory", "backups", "outgoing queue"}
+REALERT_HOURS = 24
+
+
+def alert_recipient():
+    return (load_settings().get("alert_email") or C.get("LETSENCRYPT_EMAIL")
+            or C.get("ADMIN_EMAIL"))
+
+
+def alerts_config(email=None, weekly=None):
+    s = load_settings()
+    if email is not None:
+        s["alert_email"] = lower_email(email, "alert address") if email else ""
+    if weekly is not None:
+        s["weekly_report"] = weekly in (True, "yes", "on", "1")
+    save_settings(s)
+    audit(f"alerts config email={s.get('alert_email') or 'default'} weekly={s.get('weekly_report', True)}")
+    return alerts_status()
+
+
+def alerts_status():
+    s = load_settings()
+    state = read_json(ALERT_STATE, {})
+    return {"recipient": alert_recipient(), "custom": bool(s.get("alert_email")),
+            "weekly_report": s.get("weekly_report", True),
+            "open": [dict(v, key=k) for k, v in state.get("open", {}).items()],
+            "last_run": state.get("last_run")}
+
+
+def send_mail(to, subject, body):
+    msg = (f"From: Mail server <postmaster@{C['DOMAIN']}>\n"
+           f"To: {to}\n"
+           f"Subject: [{C['MAIL_HOSTNAME']}] {subject}\n"
+           "Content-Type: text/plain; charset=utf-8\n"
+           "Auto-Submitted: auto-generated\n\n" + body)
+    p = subprocess.run(["/usr/sbin/sendmail", "-t", "-oi", "-f", f"postmaster@{C['DOMAIN']}"],
+                       input=msg.encode(), capture_output=True, timeout=60)
+    if p.returncode != 0:
+        raise Fail(f"could not send mail: {p.stderr.decode(errors='replace').strip()[:200]}")
+
+
+def alertable(r):
+    if r["status"] == "error":
+        return True
+    return r["status"] == "warn" and r["name"] in ALERT_WARN_NAMES
+
+
+def ratelimit_hits(since_ts):
+    """Users who hit the outgoing limit since since_ts (from the Rspamd log)."""
+    hits = {}
+    try:
+        with open("/var/log/rspamd/rspamd.log", errors="replace") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 5_000_000))
+            for line in f:
+                if "RATELIMITED" not in line and "ratelimit" not in line.lower():
+                    continue
+                m = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", line)
+                u = re.search(r"user: ([^,\s]+)", line)
+                if not m or not u or "ratelimit" not in line.lower():
+                    continue
+                ts = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+                if ts > since_ts and ("soft reject" in line or "RATELIMITED" in line):
+                    hits[u.group(1)] = hits.get(u.group(1), 0) + 1
+    except OSError:
+        pass
+    return hits
+
+
+def alerts_run():
+    state = read_json(ALERT_STATE, {})
+    now = time.time()
+    last = state.get("last_run_ts", now - 900)
+    open_ = state.get("open", {})
+    rows = checks(include_dns=True)
+    current = {f"{r['group']}: {r['name']}": r for r in rows if alertable(r)}
+    new, repeat = [], []
+    for k, r in current.items():
+        prev = open_.get(k)
+        if not prev:
+            new.append((k, r))
+            open_[k] = {"since": now, "sent": now, "detail": r["detail"]}
+        elif now - prev.get("sent", 0) > REALERT_HOURS * 3600:
+            repeat.append((k, r))
+            prev["sent"] = now
+            prev["detail"] = r["detail"]
+    resolved = [k for k in list(open_) if k not in current]
+    for k in resolved:
+        del open_[k]
+    hits = ratelimit_hits(last)
+    lines = []
+    if new or repeat:
+        lines.append("PROBLEMS\n")
+        for k, r in new + repeat:
+            lines.append(f"  ✗ {k}: {r['detail']}" + ("   (still failing)" if (k, r) in repeat else ""))
+        lines.append("")
+    if hits:
+        lines.append("OUTGOING LIMIT REACHED - check these accounts; a stolen password is the usual cause\n")
+        for u, n in sorted(hits.items()):
+            lines.append(f"  ! {u}: {n} message(s) held back")
+        lines.append("")
+    if resolved:
+        lines.append("RESOLVED\n")
+        lines += [f"  ✓ {k}" for k in resolved]
+        lines.append("")
+    sent = False
+    if lines:
+        count = len(new) + len(repeat)
+        subject = (f"{count} problem(s) need attention" if count else
+                   "Outgoing limit reached" if hits else "All problems resolved")
+        body = "\n".join(lines) + (f"\nDetails: https://{C['MAIL_HOSTNAME']}/admin/health\n"
+                                   "Sent by the mail server's automatic checks (every 15 minutes).\n")
+        try:
+            send_mail(alert_recipient(), subject, body)
+            sent = True
+        except Fail as e:
+            print(f"mailctl: {e}", file=sys.stderr)
+    state.update(open=open_, last_run_ts=now,
+                 last_run=datetime.datetime.now().isoformat(timespec="seconds"))
+    os.makedirs(STATE_DIR, exist_ok=True)
+    write_json(ALERT_STATE, state, mode=0o640)
+    info(f"{len(current)} open problem(s), {len(new)} new, {len(resolved)} resolved"
+         + (", alert sent" if sent else ""))
+    return {"open": len(current), "new": len(new), "resolved": len(resolved), "sent": sent,
+            "ratelimited": hits}
+
+
+def alerts_test():
+    send_mail(alert_recipient(), "Test alert",
+              "This is a test of the mail server's alert emails. If you can read this, alerts work.\n")
+    audit("alerts test")
+    info(f"test alert sent to {alert_recipient()}")
+    return {"sent_to": alert_recipient()}
+
+
+def mail_stats(days=7):
+    """Counts from the Postfix and Rspamd logs for the last N days."""
+    since = f"{days} days ago"
+    p = run(["journalctl", "--no-pager", "-o", "cat", "-u", "postfix@-.service", "--since", since],
+            check=False, timeout=300)
+    st = {"received": 0, "sent": 0, "bounced": 0, "rejected": 0}
+    for line in p.stdout.splitlines():
+        if "status=sent" in line:
+            if "relay=" in line and "dovecot" in line:
+                st["received"] += 1
+            elif "postfix/smtp[" in line or "relay=[" in line:
+                st["sent"] += 1
+        elif "status=bounced" in line:
+            st["bounced"] += 1
+        elif "NOQUEUE: reject" in line or "milter-reject" in line:
+            st["rejected"] += 1
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    junk = 0
+    try:
+        with open("/var/log/rspamd/rspamd.log", errors="replace") as f:
+            for line in f:
+                if line[:19] >= cutoff and "(add header)" in line:
+                    junk += 1
+    except OSError:
+        pass
+    st["to_junk"] = junk
+    return st
+
+
+def report_weekly(force=False):
+    if not force and not load_settings().get("weekly_report", True):
+        info("weekly report is switched off")
+        return {"sent": False}
+    st = mail_stats(7)
+    rows = checks(include_dns=True)
+    bad = [r for r in rows if r["status"] == "error"]
+    users = sorted(user_list(), key=lambda u: u["used_bytes"] or 0, reverse=True)
+    dm = dmarc_summary(7)
+    lines = [f"Weekly report for {C['MAIL_HOSTNAME']}", "",
+             "MAIL (last 7 days)",
+             f"  received        {st['received']}",
+             f"  sent out        {st['sent']}",
+             f"  put in Junk     {st['to_junk']}",
+             f"  refused         {st['rejected']}   (spam, unknown recipients, bots)",
+             f"  bounced         {st['bounced']}", "",
+             "HEALTH",
+             ("  ✓ all checks pass" if not bad else
+              "\n".join(f"  ✗ {r['group']}: {r['name']} - {r['detail']}" for r in bad)), "",
+             "LARGEST MAILBOXES"]
+    for u in users[:5]:
+        q = f" of {u['quota']}" if u["quota"] else ""
+        lines.append(f"  {u['email']:<40} {human_bytes(u['used_bytes'])}{q}")
+    lines += ["", "DMARC (who sends mail as your domains)"]
+    if not dm["domains"]:
+        lines.append("  no DMARC reports received this week")
+    for d in dm["domains"]:
+        lines.append(f"  {d['domain']}: {d['messages']} messages reported, {d['failed']} failed checks"
+                     + (f", {d['foreign_failed']} from other servers (possible spoofing)" if d["foreign_failed"] else ""))
+    b = backup_list()
+    lines += ["", "BACKUPS", f"  last backup: {b[0]['created'][:16].replace('T', ' ') if b else 'none'}",
+              "", f"Dashboard: https://{C['MAIL_HOSTNAME']}/admin/", ""]
+    send_mail(alert_recipient(), "Weekly report", "\n".join(lines))
+    info(f"weekly report sent to {alert_recipient()}")
+    return {"sent": True, "stats": st}
+
+
+# ------------------------------------------------------------------ DMARC reports
+
+DMARC_DIR = "/var/lib/mail-server/dmarc"
+
+
+def dmarc_reports(days=30):
+    cutoff = time.time() - int(days) * 86400
+    out = []
+    for f in glob.glob(os.path.join(DMARC_DIR, "*.json")):
+        r = read_json(f, None)
+        if r and r.get("end", 0) >= cutoff:
+            out.append(r)
+    return sorted(out, key=lambda r: r.get("end", 0), reverse=True)
+
+
+def dmarc_summary(days=30):
+    own = {C.get("SERVER_IPV4"), C.get("SERVER_IPV6")} - {None, ""}
+    doms = {}
+    for rep in dmarc_reports(days):
+        d = doms.setdefault(rep.get("domain", "?"), {"domain": rep.get("domain", "?"), "reports": 0,
+                                                     "messages": 0, "failed": 0, "foreign_failed": 0,
+                                                     "sources": {}, "reporters": set()})
+        d["reports"] += 1
+        d["reporters"].add(rep.get("org", "?"))
+        for rec in rep.get("records", []):
+            n = int(rec.get("count", 0))
+            ok = rec.get("dkim") == "pass" or rec.get("spf") == "pass"
+            d["messages"] += n
+            key = (rec.get("ip", "?"), rec.get("header_from", ""))
+            s = d["sources"].setdefault(key, {"ip": key[0], "header_from": key[1], "messages": 0,
+                                              "passed": 0, "failed": 0, "own": key[0] in own,
+                                              "dispositions": {}})
+            s["messages"] += n
+            s["passed" if ok else "failed"] += n
+            disp = rec.get("disposition", "none")
+            s["dispositions"][disp] = s["dispositions"].get(disp, 0) + n
+            if not ok:
+                d["failed"] += n
+                if key[0] not in own:
+                    d["foreign_failed"] += n
+    out = []
+    for d in doms.values():
+        d["reporters"] = sorted(d["reporters"])
+        d["sources"] = sorted(d["sources"].values(), key=lambda s: (-s["failed"], -s["messages"]))
+        out.append(d)
+    return {"days": int(days), "domains": sorted(out, key=lambda d: d["domain"])}
+
+
+# ------------------------------------------------------------------ DNS automation
+
+DNS_API_FILE = "/etc/mail-server/dns-api.json"
+
+
+class DnsApiError(Fail):
+    pass
+
+
+def _http(method, url, headers, body=None):
+    import urllib.error
+    import urllib.request
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers=dict(headers, **{"Content-Type": "application/json"}))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            txt = r.read().decode()
+            return json.loads(txt) if txt else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:300]
+        raise DnsApiError(f"DNS provider refused the request ({e.code}): {detail}")
+    except (OSError, ValueError) as e:
+        raise DnsApiError(f"could not reach the DNS provider: {e}")
+
+
+def _norm_host(h):
+    return (h or "").strip().rstrip(".").lower()
+
+
+def _norm_txt(t):
+    t = (t or "").strip()
+    if t.startswith('"'):
+        t = "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', t))
+    return t
+
+
+class Cloudflare:
+    name = "Cloudflare"
+
+    def __init__(self, token):
+        self.base = os.environ.get("MAILCTL_DNS_API_URL", "https://api.cloudflare.com/client/v4")
+        self.h = {"Authorization": f"Bearer {token}"}
+
+    def zone(self, domain):
+        parts = domain.split(".")
+        for i in range(len(parts) - 1):
+            z = ".".join(parts[i:])
+            r = _http("GET", f"{self.base}/zones?name={z}", self.h)
+            if r.get("result"):
+                return r["result"][0]["id"], z
+        raise DnsApiError(f"{domain} is not in this Cloudflare account")
+
+    def list(self, zone, fqdn, rtype):
+        r = _http("GET", f"{self.base}/zones/{zone}/dns_records?type={rtype}&name={fqdn}&per_page=100", self.h)
+        out = []
+        for x in r.get("result", []):
+            rec = {"id": x["id"], "type": x["type"], "fqdn": _norm_host(x["name"])}
+            if x["type"] == "SRV":
+                d = x.get("data") or {}
+                rec["value"] = f"{d.get('priority')} {d.get('weight')} {d.get('port')} {_norm_host(d.get('target'))}"
+            elif x["type"] == "MX":
+                rec["value"] = f"{x.get('priority')} {_norm_host(x['content'])}"
+            elif x["type"] == "TXT":
+                rec["value"] = _norm_txt(x["content"])
+            else:
+                rec["value"] = _norm_host(x["content"])
+            out.append(rec)
+        return out
+
+    def _body(self, rec):
+        b = {"type": rec["type"], "name": rec["fqdn"], "ttl": 1}
+        if rec["type"] == "MX":
+            prio, host = rec["value"].split()
+            b.update(content=_norm_host(host), priority=int(prio))
+        elif rec["type"] == "SRV":
+            prio, weight, port, target = rec["value"].split()
+            b["data"] = {"priority": int(prio), "weight": int(weight), "port": int(port),
+                         "target": _norm_host(target)}
+        elif rec["type"] == "TXT":
+            b["content"] = rec["value"]
+        else:
+            b.update(content=_norm_host(rec["value"]), proxied=False)
+        return b
+
+    def create(self, zone, rec):
+        _http("POST", f"{self.base}/zones/{zone}/dns_records", self.h, self._body(rec))
+
+    def update(self, zone, rid, rec):
+        _http("PUT", f"{self.base}/zones/{zone}/dns_records/{rid}", self.h, self._body(rec))
+
+    def delete(self, zone, rid):
+        _http("DELETE", f"{self.base}/zones/{zone}/dns_records/{rid}", self.h)
+
+
+class DigitalOcean:
+    name = "DigitalOcean"
+
+    def __init__(self, token):
+        self.base = os.environ.get("MAILCTL_DNS_API_URL", "https://api.digitalocean.com/v2")
+        self.h = {"Authorization": f"Bearer {token}"}
+
+    def zone(self, domain):
+        parts = domain.split(".")
+        for i in range(len(parts) - 1):
+            z = ".".join(parts[i:])
+            try:
+                _http("GET", f"{self.base}/domains/{z}", self.h)
+                return z, z
+            except DnsApiError as e:
+                if "(404)" not in str(e):
+                    raise
+        raise DnsApiError(f"{domain} is not in this DigitalOcean account")
+
+    def _rel(self, zone, fqdn):
+        return "@" if fqdn == zone else fqdn[:-(len(zone) + 1)]
+
+    def list(self, zone, fqdn, rtype):
+        r = _http("GET", f"{self.base}/domains/{zone}/records?type={rtype}&name={fqdn}&per_page=200", self.h)
+        out = []
+        for x in r.get("domain_records", []):
+            name = zone if x["name"] == "@" else f"{x['name']}.{zone}"
+            rec = {"id": x["id"], "type": x["type"], "fqdn": _norm_host(name)}
+            if x["type"] == "MX":
+                rec["value"] = f"{x.get('priority')} {_norm_host(x['data'])}"
+            elif x["type"] == "SRV":
+                rec["value"] = f"{x.get('priority')} {x.get('weight')} {x.get('port')} {_norm_host(x['data'])}"
+            elif x["type"] == "TXT":
+                rec["value"] = _norm_txt(x["data"])
+            else:
+                rec["value"] = _norm_host(x["data"])
+            out.append(rec)
+        return out
+
+    def _body(self, zone, rec):
+        b = {"type": rec["type"], "name": self._rel(zone, rec["fqdn"]), "ttl": 1800}
+        if rec["type"] == "MX":
+            prio, host = rec["value"].split()
+            b.update(data=_norm_host(host) + ".", priority=int(prio))
+        elif rec["type"] == "SRV":
+            prio, weight, port, target = rec["value"].split()
+            b.update(data=_norm_host(target) + ".", priority=int(prio), weight=int(weight), port=int(port))
+        elif rec["type"] == "CNAME":
+            b["data"] = _norm_host(rec["value"]) + "."
+        else:
+            b["data"] = rec["value"]
+        return b
+
+    def create(self, zone, rec):
+        _http("POST", f"{self.base}/domains/{zone}/records", self.h, self._body(zone, rec))
+
+    def update(self, zone, rid, rec):
+        _http("PUT", f"{self.base}/domains/{zone}/records/{rid}", self.h, self._body(zone, rec))
+
+    def delete(self, zone, rid):
+        _http("DELETE", f"{self.base}/domains/{zone}/records/{rid}", self.h)
+
+
+DNS_PROVIDERS = {"cloudflare": Cloudflare, "digitalocean": DigitalOcean}
+
+
+def dns_provider_status():
+    cfg = read_json(DNS_API_FILE, {})
+    return {"provider": cfg.get("provider", ""),
+            "name": DNS_PROVIDERS[cfg["provider"]].name if cfg.get("provider") in DNS_PROVIDERS else "",
+            "connected": bool(cfg.get("token"))}
+
+
+def dns_provider_set(provider, off=False):
+    if off:
+        if os.path.exists(DNS_API_FILE):
+            os.remove(DNS_API_FILE)
+        audit("dns provider off")
+        return dns_provider_status()
+    provider = (provider or "").lower()
+    if provider not in DNS_PROVIDERS:
+        raise Fail(f"unsupported DNS provider '{provider}' (use: {', '.join(DNS_PROVIDERS)})")
+    token = sys.stdin.readline().strip() if not sys.stdin.isatty() else getpass.getpass("API token: ").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_\-.]{20,300}", token):
+        raise Fail("that does not look like an API token")
+    api = DNS_PROVIDERS[provider](token)
+    api.zone(C["DOMAIN"])  # proves the token works and can see the domain
+    fd = os.open(DNS_API_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"provider": provider, "token": token}, f)
+    os.replace(DNS_API_FILE + ".tmp", DNS_API_FILE)
+    audit(f"dns provider {provider}")
+    info(f"connected to {api.name}")
+    return dns_provider_status()
+
+
+def _desired_matches(want, have):
+    """Existing records at the same name/type that 'want' should replace."""
+    t = want["type"]
+    if t == "TXT":
+        prefix = want["value"].split(";")[0].split(" ")[0]
+        return [h for h in have if h["value"].startswith(prefix)]
+    return have
+
+
+def dns_apply(domain=None, dry_run=True):
+    """Create/update this server's DNS records through the provider's API."""
+    domain = lower_domain(domain or C["DOMAIN"])
+    cfg = read_json(DNS_API_FILE, {})
+    if not cfg.get("token") or cfg.get("provider") not in DNS_PROVIDERS:
+        raise Fail("no DNS provider connected (mailctl dns provider set cloudflare|digitalocean)")
+    api = DNS_PROVIDERS[cfg["provider"]](cfg["token"])
+    zone_id, zone = api.zone(domain)
+    plan = []
+    for rec in dns_records(domain):
+        fqdn = _norm_host(rec["fqdn"])
+        if not (fqdn == zone or fqdn.endswith("." + zone)):
+            plan.append({"action": "skip", "type": rec["type"], "fqdn": fqdn, "value": rec["value"],
+                         "note": f"not in the {zone} zone - create it at that domain's provider"})
+            continue
+        want = {"type": rec["type"], "fqdn": fqdn,
+                "value": rec["value"] if rec["type"] == "TXT" else
+                " ".join(_norm_host(x) if i == len(rec["value"].split()) - 1 else x
+                         for i, x in enumerate(rec["value"].split()))}
+        have = api.list(zone_id, fqdn, rec["type"])
+        if rec["type"] == "CNAME":
+            clash = api.list(zone_id, fqdn, "A") + api.list(zone_id, fqdn, "AAAA")
+            if clash:
+                plan.append({"action": "skip", "type": "CNAME", "fqdn": fqdn, "value": want["value"],
+                             "note": "an A/AAAA record already uses this name - left alone"})
+                continue
+        match = _desired_matches(want, have)
+        if any(h["value"] == want["value"] for h in match) and len(match) == 1:
+            plan.append({"action": "keep", "type": want["type"], "fqdn": fqdn, "value": want["value"]})
+            continue
+        if match:
+            plan.append({"action": "update", "type": want["type"], "fqdn": fqdn, "value": want["value"],
+                         "old": match[0]["value"], "id": match[0]["id"]})
+            for extra in match[1:]:
+                plan.append({"action": "delete", "type": want["type"], "fqdn": fqdn,
+                             "value": extra["value"], "id": extra["id"]})
+        else:
+            plan.append({"action": "create", "type": want["type"], "fqdn": fqdn, "value": want["value"]})
+    if not dry_run:
+        for p in plan:
+            rec = {"type": p["type"], "fqdn": p["fqdn"], "value": p["value"]}
+            if p["action"] == "create":
+                api.create(zone_id, rec)
+            elif p["action"] == "update":
+                api.update(zone_id, p["id"], rec)
+            elif p["action"] == "delete":
+                api.delete(zone_id, p["id"])
+        changed = sum(1 for p in plan if p["action"] in ("create", "update", "delete"))
+        audit(f"dns apply {domain}: {changed} change(s) via {api.name}")
+        info(f"{changed} DNS change(s) made at {api.name}")
+    for p in plan:
+        p.pop("id", None)
+    return {"domain": domain, "zone": zone, "provider": api.name, "dry_run": dry_run, "plan": plan}
 
 
 # ------------------------------------------------------------------ output
@@ -1117,6 +2154,16 @@ def show_status(s):
           f"{human_bytes(s['disk']['free'])} free")
 
 
+def show_rules(r):
+    f, v = r.get("forward"), r.get("vacation")
+    print(f"forwarding: {', '.join(f['to']) + (' (keeping a copy)' if f['keep'] else ' (no copy kept)') if f else 'off'}")
+    if v:
+        when = f"{v['start'] or 'now'} to {v['end'] or 'until switched off'}"
+        print(f"vacation:   on, {when}: {v['subject']}")
+    else:
+        print("vacation:   off")
+
+
 def show_checks(rows):
     group = None
     for r in rows:
@@ -1138,6 +2185,11 @@ Mailboxes
   user del <email> [--purge]      Remove a mailbox (--purge also deletes its mail)
   user list                       List mailboxes with usage and quota
   user info <email>               Details for one mailbox
+  user forward <email> --to a@x[,b@y] [--no-keep] | --off
+                                  Forward mail (keeps a copy unless --no-keep)
+  user vacation <email> [--subject S] [--start YYYY-MM-DD] [--end YYYY-MM-DD] | --off
+                                  Auto-reply; the message is read from stdin
+  user rules <email>              Show forwarding and vacation settings
 
 Aliases / forwarding
   alias add <alias> <dest>[,<dest>...]
@@ -1145,6 +2197,14 @@ Aliases / forwarding
                                   Use @domain as <alias> for a catch-all.
   alias del <alias>               Remove an alias
   alias list                      List aliases
+  alias temp add <owner> [--days N] [--note TEXT]
+                                  Create a random throwaway address for a mailbox
+  alias temp list [--owner E] | temp del <address> | temp expire
+
+Shared mailboxes
+  share add <mailbox> <member>    Let <member> read <mailbox> and send as it
+  share del <mailbox> <member>    Remove that access
+  share list                      Show shared mailboxes
 
 Domains
   domain add <domain>             Host mail for another domain (creates its DKIM key)
@@ -1155,6 +2215,10 @@ Health
   status                          Services, certificate, counts, disk
   check                           Full health check (services, DNS, blocklists, ...)
   dns [domain] [--check]          DNS records to create (--check verifies them live)
+  dns provider set cloudflare|digitalocean   Connect a DNS provider (API token on stdin)
+  dns provider [status] | dns provider off
+  dns apply [domain] [--yes]      Create/update the records at the provider (preview without --yes)
+  dmarc [--days N]                DMARC reports: who sends mail as your domains
 
 Operations
   queue [list]                    Outgoing mail waiting to be delivered
@@ -1166,6 +2230,18 @@ Operations
   backup [--background]           Run a backup now
   backup list                     List backups
   cert                            Get/extend the Let's Encrypt certificate
+  junk [--user E] [--days N]      Spam quarantine (Junk folders)
+  junk release|delete <mailbox> <id>
+  search rebuild [email]          Rebuild the full-text search index
+
+Delivery & alerts
+  relay set <host> [--port 587] [--user U] [--spf include:x]   (password on stdin)
+  relay [status] | relay test | relay off
+                                  Send outgoing mail through a relay service
+  limit [status] | limit set <n>  Messages each user may send per hour (0 = no limit)
+  alerts [status] | alerts run | alerts test
+  alerts config [--email E] [--weekly yes|no]
+  report [--force]                Send the weekly report now
 
 Admin dashboard (https://<mail hostname>/admin/)
   admin add <email>               Allow a mailbox to use the admin dashboard
@@ -1248,6 +2324,19 @@ def main(argv):
                 ["mailbox", "used", "quota", "messages", ""]))
         elif sub == "info":
             emit(user_info(arg), lambda u: print(json.dumps(u, indent=2)))
+        elif sub == "forward":
+            off = flag("--off")
+            keep = not flag("--no-keep")
+            to = opt("--to", "")
+            a = args[2:]
+            emit(user_forward(a[0] if a else "", to, keep, off), show_rules)
+        elif sub == "vacation":
+            off = flag("--off")
+            subject, start, end = opt("--subject", ""), opt("--start", ""), opt("--end", "")
+            a = args[2:]
+            emit(user_vacation(a[0] if a else "", subject, start, end, off), show_rules)
+        elif sub == "rules":
+            emit(rules_get(arg), show_rules)
         else:
             print(USAGE)
             return 1
@@ -1260,6 +2349,21 @@ def main(argv):
             emit(alias_list(), lambda d: table(
                 [(x["alias"], "-> " + ",".join(x["destinations"])) for x in d],
                 ["alias", "destinations"]))
+        elif sub == "temp":
+            act = a[0] if a else "list"
+            owner, days, note = opt("--owner"), opt("--days"), opt("--note", "")
+            rest = args[3:]
+            if act == "add":
+                emit(temp_add(rest[0] if rest else owner, days, note),
+                     lambda t: print(t["alias"]))
+            elif act == "del":
+                emit(temp_del(rest[0] if rest else "", owner))
+            elif act == "expire":
+                emit(temp_expire(), lambda d: print(f"expired: {len(d['expired'])}"))
+            else:
+                emit(temp_list(owner), lambda d: table(
+                    [(t["alias"], t["owner"], (t["expires"] or "never")[:10], t["note"]) for t in d],
+                    ["address", "delivers to", "expires", "note"]))
         else:
             print(USAGE)
             return 1
@@ -1275,6 +2379,25 @@ def main(argv):
         else:
             print(USAGE)
             return 1
+    elif cmd == "dns" and sub == "provider":
+        act = a[0] if a else "status"
+        if act == "set":
+            emit(dns_provider_set(a[1] if len(a) > 1 else ""))
+        elif act == "off":
+            emit(dns_provider_set(None, off=True))
+        else:
+            emit(dns_provider_status(), lambda d: print(
+                f"{d['name']} (connected)" if d["connected"] else "no DNS provider connected"))
+    elif cmd == "dns" and sub == "apply":
+        yes = flag("--yes")
+        a = args[2:]
+        res = dns_apply(a[0] if a else None, dry_run=not yes)
+
+        def show_plan(r):
+            print(f"{r['provider']} zone {r['zone']}" + ("  (preview - add --yes to apply)" if r["dry_run"] else ""))
+            table([(p["action"], p["type"], p["fqdn"], (p["value"][:60] + "...") if len(p["value"]) > 63 else p["value"])
+                   for p in r["plan"]], ["action", "type", "name", "value"])
+        emit(res, show_plan)
     elif cmd == "dns":
         check = flag("--check")
         dom = (args[1] if len(args) > 1 else C["DOMAIN"]).lower()
@@ -1330,6 +2453,74 @@ def main(argv):
         else:
             print(USAGE)
             return 1
+    elif cmd == "relay":
+        if sub == "set":
+            port, user, spf = opt("--port", 587), opt("--user", ""), opt("--spf", "")
+            a = args[2:]
+            emit(relay_set(a[0] if a else "", port, user, spf))
+        elif sub == "off":
+            emit(relay_off())
+        elif sub == "test":
+            emit(relay_test())
+        else:
+            emit(relay_status(), lambda r: print(
+                f"relay: {r['host']}:{r['port']} (user {r['user'] or '-'})" if r["enabled"] else "relay: off (direct delivery)"))
+    elif cmd == "limit":
+        if sub == "set":
+            emit(limit_set(arg))
+        else:
+            emit(limit_status(), lambda r: print(
+                f"{r['per_hour']} messages per user per hour" if r["per_hour"] else "no outgoing limit"))
+    elif cmd == "share":
+        if sub == "add":
+            emit(share_add(arg, a[1] if len(a) > 1 else ""))
+        elif sub == "del":
+            emit(share_del(arg, a[1] if len(a) > 1 else ""))
+        elif sub == "sync":
+            emit(share_sync(), lambda d: print("sharing re-applied"))
+        else:
+            emit(shares_load(), lambda d: table(
+                [(k, ", ".join(v)) for k, v in d.items()], ["mailbox", "shared with"]))
+    elif cmd == "junk":
+        if sub in ("release", "delete"):
+            emit(junk_action(sub, arg, a[1] if len(a) > 1 else ""))
+        else:
+            user, days = opt("--user"), opt("--days", 30)
+            emit(junk_list(user, days), lambda d: table(
+                [(j["date"][:16] if j["date"] else "", j["user"], j["from"][:30], j["subject"][:40], j["id"])
+                 for j in d], ["date", "mailbox", "from", "subject", "id"]))
+    elif cmd == "search":
+        if sub == "rebuild":
+            emit(search_rebuild(arg or None))
+        else:
+            print(USAGE)
+            return 1
+    elif cmd == "alerts":
+        if sub == "run":
+            emit(alerts_run())
+        elif sub == "test":
+            emit(alerts_test())
+        elif sub == "config":
+            email, weekly = opt("--email"), opt("--weekly")
+            emit(alerts_config(email, weekly))
+        else:
+            emit(alerts_status(), lambda r: print(
+                f"alerts go to {r['recipient']}; weekly report {'on' if r['weekly_report'] else 'off'}; "
+                f"{len(r['open'])} open problem(s)"))
+    elif cmd == "report":
+        emit(report_weekly(force=flag("--force")))
+    elif cmd == "dmarc":
+        days = opt("--days", 30)
+
+        def show_dmarc(r):
+            if not r["domains"]:
+                print("no DMARC reports yet")
+            for d in r["domains"]:
+                print(f"\n{d['domain']}: {d['reports']} reports, {d['messages']} messages, "
+                      f"{d['failed']} failed ({d['foreign_failed']} from other servers)")
+                table([(x["ip"], "this server" if x["own"] else "", x["messages"], x["passed"], x["failed"])
+                       for x in d["sources"][:20]], ["source ip", "", "messages", "passed", "failed"])
+        emit(dmarc_summary(days), show_dmarc)
     elif cmd == "cert":
         emit(cert_refresh())
     elif cmd == "migrate":

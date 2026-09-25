@@ -10,6 +10,26 @@ From the terminal: `sudo mailctl dns` prints them and `sudo mailctl dns --check`
 verifies them. The examples below use `example.com`,
 `mail.example.com` and the IP `203.0.113.10`.
 
+## Let the server create them
+
+With **Cloudflare** or **DigitalOcean**, the server can create and update all
+of these records through the provider's API:
+
+1. Create an API token.
+   - **Cloudflare:** My Profile → API Tokens → Create Token, using the "Edit zone DNS" template, limited to your domain.
+   - **DigitalOcean:** API → Generate New Token, with write scope.
+2. Dashboard → **Delivery & alerts → DNS automation**: choose the provider and
+   paste the token. (Or set `DNS_PROVIDER` and `DNS_API_TOKEN` before
+   installing.)
+3. Open a domain on the **Domains & DNS** page, then **Create records at …**.
+   You see every change first. Nothing is touched until you confirm.
+
+It only manages the records in the tables below. Other records (your website,
+Google/Microsoft verification TXT records...) are left alone. Two records are
+replaced: the domain's MX, which moves your mail to this server, and its SPF
+record. The preview warns you about both. The reverse DNS (PTR) record always
+stays manual, at your hosting provider.
+
 ## Required records at your DNS provider
 
 | Type | Name | Value | Purpose |
@@ -17,9 +37,9 @@ verifies them. The examples below use `example.com`,
 | A | `mail` | `203.0.113.10` | Where the mail server is |
 | AAAA | `mail` | your IPv6 | Only if you set `SERVER_IPV6` |
 | MX | `@` | `10 mail.example.com.` | "Mail for @example.com goes to mail.example.com" |
-| TXT | `@` | `v=spf1 mx -all` | **SPF:** only the MX server may send mail for this domain |
+| TXT | `@` | `v=spf1 mx -all` | **SPF:** only the MX server may send mail for this domain (with a relay service, its `include:` is added, e.g. `v=spf1 mx include:spf.brevo.com -all`) |
 | TXT | `mail._domainkey` | `v=DKIM1; k=rsa; p=MIIBIj...` | **DKIM:** public key that proves your mail wasn't altered (get it from `mailctl dns`) |
-| TXT | `_dmarc` | `v=DMARC1; p=quarantine; rua=mailto:postmaster@example.com; adkim=r; aspf=r` | **DMARC:** tells receivers to treat mail failing SPF and DKIM as spam, and to send you reports |
+| TXT | `_dmarc` | `v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@example.com; adkim=r; aspf=r` | **DMARC:** tells receivers to treat mail failing SPF and DKIM as spam, and to send daily reports (shown on the dashboard's DMARC page) |
 
 ## Recommended records
 

@@ -335,7 +335,8 @@ def action(fn):
                 flash(msg, "ok")
         except MailctlError as e:
             flash(str(e), "error")
-        invalidate("status", "users", "domains", "aliases", "queue", "bans", "backups", "check")
+        invalidate("status", "users", "domains", "aliases", "queue", "bans", "backups", "check",
+                   "shares", "junk", "dmarc", "delivery")
         return redirect(request.form.get("next") or request.referrer or url_for("index"))
     return wrapper
 
@@ -535,7 +536,8 @@ def domain_del(domain):
 @admin_required
 def domain_view(domain):
     records = mailctl("dns", domain)
-    return render_template("domain.html", domain=domain, records=records)
+    return render_template("domain.html", domain=domain, records=records,
+                           dnsp=cached("delivery:dnsp", 30, lambda: mailctl("dns", "provider")))
 
 
 @app.route("/api/dns/<domain>")
@@ -551,11 +553,26 @@ def api_dns(domain):
 def mailboxes():
     users = cached("users", 20, lambda: mailctl("user", "list"))
     doms = cached("domains", 30, lambda: mailctl("domain", "list"))
+    shares = cached("shares", 20, lambda: mailctl("share", "list"))
     totp = totp_load()
     for u in users:
         u["totp"] = u["email"] in totp
+        u["shared_with"] = shares.get(u["email"], [])
+        u["member_of"] = [mb for mb, members in shares.items() if u["email"] in members]
     return render_template("mailboxes.html", users=users, domains=doms,
                            default_quota=CONF.get("DEFAULT_QUOTA", ""))
+
+
+@app.route("/mailboxes/<email>/share", methods=["POST"])
+@admin_required
+@action
+def mailbox_share(email):
+    member = request.form.get("member", "").strip().lower()
+    if request.form.get("remove"):
+        mailctl("share", "del", email, member)
+        return f"{member} no longer has access to {email}."
+    mailctl("share", "add", email, member)
+    return f"{member} can now read {email} (folder Shared/{email}) and send as it."
 
 
 def _new_password(form):
@@ -777,8 +794,185 @@ def account():
         me = mailctl("user", "info", email)
     except MailctlError:
         me = {"email": email}
+    rules = mailctl("user", "rules", email)
+    temps = mailctl("alias", "temp", "list", "--owner", email)
+    junk = mailctl("junk", "--user", email, "--days", "30")
+    shared = [mb for mb, members in mailctl("share", "list").items() if email in members]
     return render_template("account.html", info=me, has_totp=email in totp_load(),
-                           dav=dav_enabled())
+                           dav=dav_enabled(), rules=rules, temps=temps, junk=junk[:50],
+                           shared=shared, today=datetime.date.today().isoformat())
+
+
+@app.route("/account/forward", methods=["POST"])
+@login_required
+@action
+def account_forward():
+    email = session["email"]
+    if request.form.get("off"):
+        mailctl("user", "forward", email, "--off")
+        return "Forwarding is off."
+    args = ["user", "forward", email, "--to", request.form.get("to", "")]
+    if not request.form.get("keep"):
+        args.append("--no-keep")
+    r = mailctl(*args)
+    return f"Mail is now forwarded to {', '.join(r['forward']['to'])}."
+
+
+@app.route("/account/vacation", methods=["POST"])
+@login_required
+@action
+def account_vacation():
+    email = session["email"]
+    if request.form.get("off"):
+        mailctl("user", "vacation", email, "--off")
+        return "Vacation reply is off."
+    args = ["user", "vacation", email, "--subject", request.form.get("subject", "").strip() or "Out of office"]
+    for k in ("start", "end"):
+        if request.form.get(k):
+            args += [f"--{k}", request.form[k]]
+    mailctl(*args, input=request.form.get("message", ""))
+    return "Vacation reply is on."
+
+
+@app.route("/account/throwaway", methods=["POST"])
+@login_required
+@action
+def account_throwaway():
+    email = session["email"]
+    if request.form.get("delete"):
+        mailctl("alias", "temp", "del", request.form["delete"], "--owner", email)
+        return f"Deleted {request.form['delete']}. Mail to it is now refused."
+    args = ["alias", "temp", "add", email, "--note", request.form.get("note", "")[:100]]
+    if request.form.get("days"):
+        args += ["--days", request.form["days"]]
+    r = mailctl(*args)
+    return f"New address: {r['alias']} (delivers to you)"
+
+
+@app.route("/account/junk", methods=["POST"])
+@login_required
+@action
+def account_junk():
+    act = request.form.get("action")
+    if act not in ("release", "delete"):
+        abort(400)
+    mailctl("junk", act, session["email"], request.form.get("id", ""))
+    return "Moved to your inbox; the spam filter learned it is not spam." if act == "release" else "Deleted."
+
+
+# ------------------------------------------------------------------ quarantine, DMARC, delivery
+
+@app.route("/quarantine")
+@admin_required
+def quarantine():
+    days = request.args.get("days", "7")
+    if days not in ("1", "7", "30"):
+        days = "7"
+    items = cached(f"junk:{days}", 30, lambda: mailctl("junk", "--days", days, timeout=300))
+    return render_template("quarantine.html", items=items, days=days)
+
+
+@app.route("/quarantine/action", methods=["POST"])
+@admin_required
+@action
+def quarantine_action():
+    act = request.form.get("action")
+    if act not in ("release", "delete"):
+        abort(400)
+    mailctl("junk", act, request.form.get("user", ""), request.form.get("id", ""))
+    return "Released to the inbox (and learned as not spam)." if act == "release" else "Deleted."
+
+
+@app.route("/dmarc")
+@admin_required
+def dmarc():
+    days = request.args.get("days", "30")
+    if days not in ("7", "30", "90"):
+        days = "30"
+    return render_template("dmarc.html", r=cached(f"dmarc:{days}", 60, lambda: mailctl("dmarc", "--days", days)),
+                           days=days)
+
+
+@app.route("/delivery")
+@admin_required
+def delivery():
+    return render_template("delivery.html", relay=mailctl("relay"), limit=mailctl("limit"),
+                           alerts=mailctl("alerts"), dnsp=mailctl("dns", "provider"))
+
+
+@app.route("/delivery/relay", methods=["POST"])
+@admin_required
+@action
+def delivery_relay():
+    act = request.form.get("action")
+    if act == "off":
+        mailctl("relay", "off")
+        return "Outgoing mail is delivered directly again."
+    if act == "test":
+        mailctl("relay", "test", timeout=60)
+        return "Connected to the relay service and logged in."
+    args = ["relay", "set", request.form.get("host", ""), "--port", request.form.get("port", "587")]
+    if request.form.get("user"):
+        args += ["--user", request.form["user"]]
+    if request.form.get("spf"):
+        args += ["--spf", request.form["spf"]]
+    r = mailctl(*args, input=request.form.get("password", "") + "\n")
+    return (f"Outgoing mail now goes through {r['host']}:{r['port']}. "
+            "Update your SPF record (Domains & DNS) so receivers accept it.")
+
+
+@app.route("/delivery/limit", methods=["POST"])
+@admin_required
+@action
+def delivery_limit():
+    r = mailctl("limit", "set", request.form.get("per_hour", "0"))
+    return f"Each user may now send {r['per_hour']} messages per hour." if r["per_hour"] else "Outgoing limit removed."
+
+
+@app.route("/delivery/alerts", methods=["POST"])
+@admin_required
+@action
+def delivery_alerts():
+    act = request.form.get("action")
+    if act == "test":
+        r = mailctl("alerts", "test")
+        return f"Test alert sent to {r['sent_to']}."
+    if act == "report":
+        mailctl("report", "--force", timeout=300)
+        return "Weekly report sent."
+    mailctl("alerts", "config", "--email", request.form.get("email", "").strip(),
+            "--weekly", "yes" if request.form.get("weekly") else "no")
+    return "Alert settings saved."
+
+
+@app.route("/delivery/dns-provider", methods=["POST"])
+@admin_required
+@action
+def delivery_dns_provider():
+    if request.form.get("action") == "off":
+        mailctl("dns", "provider", "off")
+        return "DNS provider disconnected; the API token was deleted."
+    r = mailctl("dns", "provider", "set", request.form.get("provider", ""),
+                input=request.form.get("token", "").strip() + "\n", timeout=60)
+    return f"Connected to {r['name']}. Use 'Create records automatically' on a domain's page."
+
+
+@app.route("/domains/<domain>/dns-apply", methods=["POST"])
+@admin_required
+def domain_dns_apply(domain):
+    confirm = request.form.get("confirm") == "1"
+    try:
+        args = ["dns", "apply", domain] + (["--yes"] if confirm else [])
+        r = mailctl(*args, timeout=180)
+    except MailctlError as e:
+        flash(str(e), "error")
+        return redirect(url_for("domain_view", domain=domain))
+    if confirm:
+        invalidate("check")
+        changed = sum(1 for p in r["plan"] if p["action"] in ("create", "update", "delete"))
+        flash(f"{changed} DNS change(s) made at {r['provider']}. They usually take effect within minutes.", "ok")
+        return redirect(url_for("domain_view", domain=domain))
+    return render_template("dns_plan.html", domain=domain, r=r)
 
 
 @app.route("/account/password", methods=["POST"])

@@ -33,6 +33,7 @@
         <td><strong>{{ u.email }}</strong>
           {% if u.admin %}<span class="badge">admin</span>{% endif %}
           {% if u.totp %}<span class="badge ok" title="Two-factor sign-in for the dashboard">2FA</span>{% endif %}
+          {% if u.shared_with %}<br><small class="muted">shared with {{ u.shared_with|join(', ') }}</small>{% endif %}
         </td>
         <td class="usage">
           {% if u.quota_bytes %}
@@ -58,6 +59,19 @@
                 <input name="quota" value="{{ u.quota }}" placeholder="unlimited" size="8" aria-label="Storage limit">
                 <button class="btn small">Set limit</button>
               </form>
+              <form method="post" action="{{ url_for('mailbox_share', email=u.email) }}">
+                <input type="hidden" name="csrf" value="{{ csrf }}">
+                <label>Share with <small class="muted">(they can read it and send as it)</small>
+                  <select name="member">{% for o in users if o.email != u.email and o.email not in u.shared_with %}<option>{{ o.email }}</option>{% endfor %}</select>
+                </label>
+                <button class="btn small">Share</button>
+              </form>
+              {% for m in u.shared_with %}
+              <form method="post" action="{{ url_for('mailbox_share', email=u.email) }}" class="row">
+                <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="member" value="{{ m }}"><input type="hidden" name="remove" value="1">
+                <small>{{ m }}</small><button class="btn small">Stop sharing</button>
+              </form>
+              {% endfor %}
               <form method="post" action="{{ url_for('mailbox_admin', email=u.email) }}">
                 <input type="hidden" name="csrf" value="{{ csrf }}">
                 <input type="hidden" name="make" value="{{ '0' if u.admin else '1' }}">

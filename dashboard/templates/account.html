@@ -58,6 +58,102 @@
   </div>
 </section>
 
+<div class="grid two">
+<section class="card">
+  <h2>Forwarding</h2>
+  {% set f = rules.forward %}
+  {% if f %}<p><span class="badge ok">On</span> Mail is forwarded to <strong>{{ f.to|join(', ') }}</strong>{{ ', and a copy is kept here' if f.keep else ' (no copy is kept here)' }}. Spam is never forwarded.</p>{% endif %}
+  <form method="post" action="{{ url_for('account_forward') }}" class="formgrid">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Forward my mail to <small class="muted">(up to 4 addresses, comma separated)</small>
+      <input name="to" value="{{ f.to|join(', ') if f }}" placeholder="me@gmail.com" required></label>
+    <label class="check"><input type="checkbox" name="keep" value="1" {{ 'checked' if not f or f.keep }}> Keep a copy in this mailbox</label>
+    <div class="row">
+      <button class="btn primary">{{ 'Update' if f else 'Turn on' }}</button>
+      {% if f %}<button class="btn danger" name="off" value="1" formnovalidate>Turn off</button>{% endif %}
+    </div>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Vacation reply</h2>
+  {% set v = rules.vacation %}
+  {% if v %}<p><span class="badge ok">On</span> {% if v.start or v.end %}from {{ v.start or 'now' }} until {{ v.end or 'you turn it off' }}{% else %}until you turn it off{% endif %}. Each sender gets it at most once every 3 days.</p>{% endif %}
+  <form method="post" action="{{ url_for('account_vacation') }}" class="formgrid">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Subject<input name="subject" maxlength="200" value="{{ v.subject if v else 'Out of office' }}"></label>
+    <label>Message<textarea name="message" rows="4" maxlength="5000" required>{{ v.message if v else '' }}</textarea></label>
+    <div class="row wrap">
+      <label>From <small class="muted">(optional)</small><input type="date" name="start" value="{{ v.start if v }}" min="{{ today }}"></label>
+      <label>Until <small class="muted">(optional)</small><input type="date" name="end" value="{{ v.end if v }}" min="{{ today }}"></label>
+    </div>
+    <div class="row">
+      <button class="btn primary">{{ 'Update' if v else 'Turn on' }}</button>
+      {% if v %}<button class="btn danger" name="off" value="1" formnovalidate>Turn off</button>{% endif %}
+    </div>
+  </form>
+</section>
+</div>
+
+<section class="card">
+  <h2>Throwaway addresses</h2>
+  <p>Extra random addresses that deliver to you. Use one per website or sign-up; if it starts getting spam, delete it and the spam stops. You can also reply from them.</p>
+  <form method="post" action="{{ url_for('account_throwaway') }}" class="row wrap">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input name="note" maxlength="100" placeholder="What is it for? (e.g. online shop)">
+    <select name="days" aria-label="Lifetime"><option value="">Keep until I delete it</option><option value="7">Delete after 7 days</option><option value="30">Delete after 30 days</option><option value="365">Delete after a year</option></select>
+    <button class="btn primary">Create address</button>
+  </form>
+  {% if temps %}
+  <table>
+    <thead><tr><th>Address</th><th>For</th><th>Expires</th><th></th></tr></thead>
+    <tbody>
+    {% for t in temps %}
+      <tr>
+        <td><code class="copy">{{ t.alias }}</code></td>
+        <td>{{ t.note }}</td>
+        <td class="nowrap">{{ t.expires[:10] if t.expires else 'never' }}</td>
+        <td class="actions"><form method="post" action="{{ url_for('account_throwaway') }}" class="inline" data-confirm="Delete {{ t.alias }}? Mail to it will be refused.">
+          <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="delete" value="{{ t.alias }}">
+          <button class="btn small danger">Delete</button></form></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Spam caught for you <small class="muted">(last 30 days)</small></h2>
+  {% if junk %}
+  <table>
+    <thead><tr><th>Received</th><th>From / subject</th><th></th></tr></thead>
+    <tbody>
+    {% for m in junk %}
+      <tr>
+        <td class="nowrap">{{ ago(m.date) }}</td>
+        <td class="clip"><strong>{{ m.subject or '(no subject)' }}</strong><br><small class="muted">{{ m.from }}</small></td>
+        <td class="actions"><form method="post" action="{{ url_for('account_junk') }}" class="inline">
+          <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ m.id }}">
+          <button class="btn small" name="action" value="release">Not spam</button>
+          <button class="btn small danger" name="action" value="delete">Delete</button></form></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No spam in the last 30 days.</p>
+  {% endif %}
+</section>
+
+{% if shared %}
+<section class="card">
+  <h2>Shared with you</h2>
+  <p>You can read these mailboxes (folder <code>Shared/…</code> in your mail app and webmail) and send mail as them:</p>
+  <ul>{% for mb in shared %}<li><code>{{ mb }}</code></li>{% endfor %}</ul>
+</section>
+{% endif %}
+
 <section class="card">
   <h2>Two-factor sign-in</h2>
   {% if has_totp %}

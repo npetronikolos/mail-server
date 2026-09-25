@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""mail-dmarc-ingest - store DMARC aggregate reports sent to dmarc-reports@<domain>.
+
+Postfix pipes each report message to this script (see master.cf "dmarc").
+It extracts the XML (plain, .gz or .zip), keeps a compact JSON summary in
+/var/lib/mail-server/dmarc/, and discards the message. The dashboard's DMARC
+page and "mailctl dmarc" read those summaries.
+
+Reports come from strangers, so everything is size-limited and parsed as
+untrusted data. Exit code 0 even for unusable reports, so senders do not get
+bounces for them.
+"""
+import email
+import email.policy
+import gzip
+import hashlib
+import io
+import json
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
+import zipfile
+
+OUT_DIR = "/var/lib/mail-server/dmarc"
+MAX_MESSAGE = 10 * 1024 * 1024
+MAX_XML = 20 * 1024 * 1024
+MAX_RECORDS = 5000
+
+
+def text(node, path, default=""):
+    el = node.find(path) if node is not None else None
+    return (el.text or "").strip()[:255] if el is not None and el.text else default
+
+
+def xml_payloads(msg):
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        name = (part.get_filename() or "").lower()
+        ctype = part.get_content_type()
+        data = part.get_payload(decode=True) or b""
+        if not data:
+            continue
+        try:
+            if name.endswith(".zip") or ctype in ("application/zip", "application/x-zip-compressed"):
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    for info in z.infolist():
+                        if info.filename.lower().endswith(".xml") and info.file_size <= MAX_XML:
+                            yield z.read(info)
+            elif name.endswith(".gz") or ctype in ("application/gzip", "application/x-gzip"):
+                with gzip.GzipFile(fileobj=io.BytesIO(data)) as g:
+                    xml = g.read(MAX_XML + 1)
+                    if len(xml) <= MAX_XML:
+                        yield xml
+            elif name.endswith(".xml") or ctype in ("text/xml", "application/xml"):
+                yield data[:MAX_XML]
+        except (zipfile.BadZipFile, OSError, EOFError):
+            continue
+
+
+def parse(xml):
+    root = ET.fromstring(xml)
+    if root.tag != "feedback":
+        return None
+    meta = root.find("report_metadata")
+    pol = root.find("policy_published")
+    records = []
+    for rec in root.findall("record")[:MAX_RECORDS]:
+        row = rec.find("row")
+        records.append({
+            "ip": text(row, "source_ip"),
+            "count": int(text(row, "count", "0") or 0),
+            "disposition": text(row, "policy_evaluated/disposition", "none"),
+            "dkim": text(row, "policy_evaluated/dkim"),
+            "spf": text(row, "policy_evaluated/spf"),
+            "header_from": text(rec, "identifiers/header_from").lower(),
+        })
+    try:
+        begin = int(text(meta, "date_range/begin", "0"))
+        end = int(text(meta, "date_range/end", "0"))
+    except ValueError:
+        begin = end = 0
+    return {"org": text(meta, "org_name", "unknown"), "report_id": text(meta, "report_id"),
+            "begin": begin, "end": end, "domain": text(pol, "domain").lower(),
+            "policy": text(pol, "p"), "records": records}
+
+
+def main():
+    raw = sys.stdin.buffer.read(MAX_MESSAGE + 1)
+    if len(raw) > MAX_MESSAGE:
+        return 0
+    msg = email.message_from_bytes(raw, policy=email.policy.compat32)
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for xml in xml_payloads(msg):
+        try:
+            rep = parse(xml)
+        except (ET.ParseError, ValueError):
+            continue
+        if not rep or not re.fullmatch(r"[a-z0-9.-]{3,253}", rep["domain"] or ""):
+            continue
+        key = hashlib.sha256(f"{rep['org']}|{rep['report_id']}|{rep['domain']}".encode()).hexdigest()[:24]
+        path = os.path.join(OUT_DIR, f"{rep['end']}-{key}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(rep, f)
+        os.replace(tmp, path)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:  # never bounce a report back to the sender
+        print(f"mail-dmarc-ingest: {e}", file=sys.stderr)
+        sys.exit(0)
