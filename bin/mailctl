@@ -9,6 +9,8 @@ import datetime
 import fcntl
 import getpass
 import glob
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -256,6 +258,21 @@ def read_users():
     return users
 
 
+def local_nets():
+    """Where the mailbox password still works once a mailbox requires app
+    passwords: webmail and the dashboard (both connect from this server) and
+    doveadm ("local" = no remote address)."""
+    nets = ["local", "127.0.0.0/8", "::1"]
+    return nets + [ip for ip in (C.get("SERVER_IPV4"), C.get("SERVER_IPV6")) if ip]
+
+
+def user_extra(u, apps_only):
+    fields = [quota_field(u["quota"])] if u["quota"] else []
+    if apps_only:
+        fields.append("allow_nets=" + ",".join(local_nets()))
+    return " ".join(fields)
+
+
 def write_users(users):
     """Atomically replace the users file.
 
@@ -263,7 +280,9 @@ def write_users(users):
     changes, so make sure the modification time always moves forward.
     """
     old = int(os.stat(USERS_FILE).st_mtime) if os.path.exists(USERS_FILE) else 0
-    text = "".join(f"{u['email']}:{u['hash']}::::::{quota_field(u['quota'])}\n" for u in users)
+    apps_only = apppw_required()
+    text = "".join(f"{u['email']}:{u['hash']}::::::{user_extra(u, u['email'] in apps_only)}\n"
+                   for u in users)
     write_file(USERS_FILE, text, mode=0o640, like=USERS_FILE)
     if int(os.stat(USERS_FILE).st_mtime) <= old:
         os.utime(USERS_FILE, (old + 1, old + 1))
@@ -325,6 +344,17 @@ def hash_password(pw):
     return "{SHA512-CRYPT}" + p.stdout.strip()
 
 
+def verify_password(pw, stored):
+    """True if pw matches a hash written by hash_password."""
+    m = re.fullmatch(r"\{(?:SHA512-CRYPT|SHA256-CRYPT|CRYPT)\}(\$([56])\$([^$]{1,16})\$[./0-9A-Za-z]+)",
+                     stored or "")
+    if not m or "\n" in pw:
+        return False
+    p = run(["openssl", "passwd", f"-{m.group(2)}", "-salt", m.group(3), "-stdin"],
+            input=pw + "\n", check=False)
+    return p.returncode == 0 and hmac.compare_digest(p.stdout.strip(), m.group(1))
+
+
 def quota_usage():
     """{email: {"used": bytes, "messages": n}} for every mailbox, from Dovecot."""
     usage = {}
@@ -380,9 +410,12 @@ def user_passwd(email):
     u["hash"] = hash_password(pw)
     write_users(users)
     sync_dovecot(email, password=pw)
-    audit(f"user passwd {email}")
-    info(f"password changed for {email}")
-    return {"email": email}
+    # Like Google and Apple: a new password also signs out every app password,
+    # in case whoever knew the old one created some.
+    revoked = apppw_clear(email)
+    audit(f"user passwd {email}" + (f" (revoked {revoked} app password(s))" if revoked else ""))
+    info(f"password changed for {email}" + (f"; {revoked} app password(s) removed" if revoked else ""))
+    return {"email": email, "app_passwords_removed": revoked}
 
 
 def user_quota(email, quota):
@@ -427,6 +460,7 @@ def user_del(email, purge=False):
 def user_list():
     usage = quota_usage()
     admins = set(read_admins())
+    apps = apppw_load()
     out = []
     for u in read_users():
         us = usage.get(u["email"])
@@ -438,7 +472,9 @@ def user_list():
         out.append({"email": u["email"], "quota": u["quota"],
                     "quota_bytes": quota_to_bytes(u["quota"]),
                     "used_bytes": us["used"], "messages": us["messages"],
-                    "admin": u["email"] in admins})
+                    "admin": u["email"] in admins,
+                    "app_passwords": len(apps.get(u["email"], {}).get("passwords", [])),
+                    "app_only": bool(apps.get(u["email"], {}).get("required"))})
     return out
 
 
@@ -827,6 +863,13 @@ def port25_out():
         return False
 
 
+def dnssec_validating():
+    """True if the system resolver, which Postfix uses, checks DNSSEC."""
+    p = run(["dig", "+dnssec", "+time=3", "+tries=2", ".", "SOA"], check=False, timeout=20)
+    m = re.search(r"^;; flags:([a-z ]*);", p.stdout or "", re.M)
+    return bool(m) and "ad" in m.group(1).split()
+
+
 def checks(include_dns=True):
     """Health checks, in the spirit of Mail-in-a-Box's status page."""
     out = []
@@ -867,6 +910,16 @@ def checks(include_dns=True):
         add("Mail", "MTA-STS resolver", "error" if broken else "ok",
             "not answering - outgoing mail is stuck (systemctl restart postfix-mta-sts-resolver)"
             if broken else "answering")
+    if not relay["enabled"]:
+        level = run(["postconf", "-h", "smtp_tls_security_level"], check=False).stdout.strip()
+        if level == "dane":
+            ok = dnssec_validating()
+            add("Mail", "DANE for outgoing mail", "ok" if ok else "error",
+                "domains that publish TLSA records only get mail over verified encryption" if ok else
+                "the DNS resolver does not check DNSSEC, so DANE is ignored (systemctl status unbound)")
+        elif C.get("ENABLE_DANE", "yes") == "yes":
+            add("Mail", "DANE for outgoing mail", "warn",
+                "off: the local resolver could not check DNSSEC when install.sh ran; run it again")
 
     cert = st["certificate"]
     if not cert:
@@ -1085,9 +1138,12 @@ def cert_refresh():
 
 
 def migrate():
-    """Rewrite the users file for the installed Dovecot version (after upgrades)."""
+    """Rewrite the users file for the installed Dovecot version (after upgrades)
+    and Dovecot's app password files (e.g. after restoring a backup)."""
     if os.path.exists(USERS_FILE):
         write_users(read_users())
+    if os.path.exists(APP_PW_FILE):
+        apppw_write(apppw_load())
     aliases = read_map(VALIASES)
     keys = {k for k, _ in aliases}
     added = [(f"dmarc-reports@{d}", DMARC_ADDRESS) for d, _ in read_map(VDOMAINS)
@@ -1198,11 +1254,19 @@ def relay_set(host, port=587, user="", spf=""):
     return relay_status()
 
 
+def direct_tls_level():
+    """Outgoing TLS without a relay: DANE when install.sh found that the
+    resolver checks DNSSEC (it then sets smtp_dns_support_level), else
+    opportunistic."""
+    dns = run(["postconf", "-h", "smtp_dns_support_level"], check=False).stdout.strip()
+    return "dane" if dns == "dnssec" else "may"
+
+
 def relay_off():
     run(["postconf", "-X", "relayhost", "smtp_sasl_auth_enable", "smtp_sasl_password_maps",
          "smtp_sasl_security_options", "smtp_sasl_tls_security_options", "smtp_tls_wrappermode"],
         check=False)
-    run(["postconf", "-e", "smtp_tls_security_level = may"])
+    run(["postconf", "-e", f"smtp_tls_security_level = {direct_tls_level()}"])
     for f in (SASL_PASSWD, SASL_PASSWD + ".db"):
         if os.path.exists(f):
             os.remove(f)
@@ -1534,6 +1598,7 @@ def forget_user(email):
         write_json(SHARES_FILE, data, group="mail-dashboard")
     for alias in [k for k, v in temp_load().items() if v["owner"] == email]:
         temp_del(alias)
+    apppw_clear(email, forget=True)
 
 
 # ------------------------------------------------------------------ Junk quarantine & search
@@ -1593,6 +1658,453 @@ def search_rebuild(user=None):
     audit("search rebuild " + (user or "all"))
     info("search index rebuild queued")
     return {"queued": True}
+
+
+# ------------------------------------------------------------------ app passwords
+
+APP_PW_FILE = "/etc/mail-server/app-passwords.json"
+APP_PW_DIR = "/etc/dovecot/app-passwords"
+APP_PW_MAX = 20
+APP_PW_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
+
+
+def apppw_load():
+    return read_json(APP_PW_FILE, {})
+
+
+def apppw_required():
+    """Mailboxes whose mail apps must use app passwords."""
+    return {e for e, v in apppw_load().items() if v.get("required")}
+
+
+def apppw_write(data):
+    """Save the list and rebuild Dovecot's copy.
+
+    Dovecot keys a passwd-file by user name, so one file cannot hold several
+    passwords for the same mailbox. Instead each app password gets its own
+    file, named after the password's SHA-256: Dovecot hashes what the mail app
+    sent to find the file (see the app-passwords passdb in dovecot.conf).
+    The passwords are random, so an unsalted hash is safe.
+    """
+    write_json(APP_PW_FILE, data, mode=0o600)
+    os.makedirs(APP_PW_DIR, exist_ok=True)
+    try:
+        shutil.chown(APP_PW_DIR, "root", "dovecot")
+    except (LookupError, OSError):
+        pass
+    os.chmod(APP_PW_DIR, 0o750)
+    want = {p["hash"]: f"{email}:{{SHA256.HEX}}{p['hash']}::::::\n"
+            for email, v in data.items() for p in v.get("passwords", [])}
+    for name in os.listdir(APP_PW_DIR):
+        if name not in want:
+            os.remove(os.path.join(APP_PW_DIR, name))
+    for h, line in want.items():
+        path = os.path.join(APP_PW_DIR, h)
+        write_file(path, line, mode=0o640)
+        try:
+            shutil.chown(path, "root", "dovecot")
+        except (LookupError, OSError):
+            pass
+
+
+def apppw_entry(data, email):
+    email = lower_email(email)
+    if not find_user(read_users(), email):
+        raise Fail(f"no such mailbox: {email}")
+    return email, data.setdefault(email, {"required": False, "passwords": []})
+
+
+def apppw_add(email, name=""):
+    import secrets as _secrets
+    data = apppw_load()
+    email, entry = apppw_entry(data, email)
+    name = re.sub(r"\s+", " ", name or "").strip()[:40] or "Mail app"
+    if not name.isprintable():
+        raise Fail("invalid name")
+    if len(entry["passwords"]) >= APP_PW_MAX:
+        raise Fail(f"at most {APP_PW_MAX} app passwords per mailbox; delete one first")
+    pw = "-".join("".join(_secrets.choice(APP_PW_ALPHABET) for _ in range(4)) for _ in range(4))
+    item = {"id": _secrets.token_hex(4), "name": name,
+            "created": datetime.datetime.now().isoformat(timespec="seconds"),
+            "hash": hashlib.sha256(pw.encode()).hexdigest()}
+    entry["passwords"].append(item)
+    apppw_write(data)
+    audit(f"apppass add {email} {item['id']} ({name})")
+    info(f"app password for {email} ({name}): {pw}")
+    return {"email": email, "id": item["id"], "name": name, "created": item["created"], "password": pw}
+
+
+def apppw_list(email):
+    email, entry = apppw_entry(apppw_load(), email)
+    return {"email": email, "required": bool(entry.get("required")),
+            "passwords": [{k: p[k] for k in ("id", "name", "created")} for p in entry["passwords"]]}
+
+
+def apppw_del(email, pid):
+    data = apppw_load()
+    email, entry = apppw_entry(data, email)
+    kept = [p for p in entry["passwords"] if p["id"] != pid]
+    if len(kept) == len(entry["passwords"]):
+        raise Fail(f"no such app password: {pid or '<none>'}")
+    entry["passwords"] = kept
+    if not kept and not entry.get("required"):
+        del data[email]
+    apppw_write(data)
+    audit(f"apppass del {email} {pid}")
+    info("app password deleted")
+    return apppw_list(email)
+
+
+def apppw_require(email, on):
+    if on not in ("yes", "no"):
+        raise Fail("use: mailctl user apppass require <email> yes|no")
+    data = apppw_load()
+    email, entry = apppw_entry(data, email)
+    entry["required"] = on == "yes"
+    if not entry["required"] and not entry["passwords"]:
+        del data[email]
+    apppw_write(data)
+    write_users(read_users())   # adds or removes the mailbox's allow_nets
+    audit(f"apppass require {email} {on}")
+    info(f"mail apps for {email} " + ("must now use app passwords" if on == "yes"
+                                      else "may use the mailbox password again"))
+    return apppw_list(email)
+
+
+def apppw_clear(email, forget=False):
+    """Revoke a mailbox's app passwords (forget=True also drops its setting)."""
+    data = apppw_load()
+    entry = data.get(email)
+    if not entry:
+        return 0
+    n = len(entry.get("passwords", []))
+    entry["passwords"] = []
+    if forget or not entry.get("required"):
+        del data[email]
+    apppw_write(data)
+    return n
+
+
+def user_checkpw(email, apps=False):
+    """Check a password read from stdin, for the dashboard's sign-in (the
+    mailbox password only) and for calendars and contacts (apps=True: app
+    passwords too, and only those once the mailbox requires them)."""
+    pw = sys.stdin.readline().rstrip("\n")
+    email = (email or "").strip().lower()
+    u = find_user(read_users(), email) if EMAIL_RE.match(email) else None
+    if not u or not pw:
+        return {"ok": False}
+    entry = apppw_load().get(email, {})
+    if apps:
+        h = hashlib.sha256(pw.encode()).hexdigest()
+        if any(hmac.compare_digest(h, p["hash"]) for p in entry.get("passwords", [])):
+            return {"ok": True, "via": "app password"}
+        if entry.get("required"):
+            return {"ok": False}
+    ok = verify_password(pw, u["hash"])
+    return {"ok": ok, "via": "password"} if ok else {"ok": False}
+
+
+# ------------------------------------------------------------------ importing mail
+
+IMPORT_DIR = "/var/lib/mail-server/imports"
+IMPORT_RUN_DIR = "/run/mail-server"
+# Not copied: Gmail's "All Mail" and "Starred" repeat mail from other folders,
+# and nobody wants the old spam and trash.
+IMPORT_SKIP = ("\\All", "\\Flagged", "\\Junk", "\\Trash")
+# Folders that arrive under the old server's name are merged into ours.
+IMPORT_MERGE = {"\\Sent": "Sent", "\\Drafts": "Drafts", "\\Archive": "Archive"}
+
+
+def import_paths(email):
+    """State, log, Dovecot config (holds the old password) and unit prefix."""
+    key = hashlib.sha256(email.encode()).hexdigest()[:16]
+    return (os.path.join(IMPORT_DIR, f"{key}.json"), os.path.join(IMPORT_DIR, f"{key}.log"),
+            os.path.join(IMPORT_RUN_DIR, f"import-{key}.conf"), f"mail-import-{key}")
+
+
+def import_check_host(host, allow_private):
+    try:
+        addrs = {ipaddress.ip_address(a[4][0]) for a in socket.getaddrinfo(host, None)}
+    except (OSError, ValueError):
+        raise Fail(f"{host} does not resolve; check the server name")
+    own = {C.get("SERVER_IPV4"), C.get("SERVER_IPV6")} - {None, ""}
+    for ip in addrs:
+        if str(ip) in own:
+            raise Fail(f"{host} is this server; enter the old provider's IMAP server")
+        if not ip.is_global and not allow_private:
+            raise Fail(f"{host} points to a private address ({ip}); only servers on the internet can be imported from")
+
+
+def import_probe(host, port, security, user, pw):
+    """Log in to the old server and list its folders: [(name, flags, delimiter)]."""
+    import imaplib
+    import ssl as _ssl
+    ctx = _ssl.create_default_context()
+    # Accept what Dovecot will accept (OpenSSL's defaults). Python 3.13+ adds
+    # extra certificate rules; chain and host name are still verified.
+    ctx.verify_flags &= ~getattr(_ssl, "VERIFY_X509_STRICT", 0)
+    try:
+        if security == "ssl":
+            m = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=30)
+        else:
+            m = imaplib.IMAP4(host, port, timeout=30)
+            m.starttls(ssl_context=ctx)
+        try:
+            m.login(user, pw)
+        except imaplib.IMAP4.error as e:
+            why = e.args[0] if e.args else ""
+            why = why.decode(errors="replace") if isinstance(why, bytes) else str(why)
+            raise Fail(f"the old server refused the login: {why}"
+                       " (Gmail, Yahoo and iCloud need an app password from your account settings)")
+        typ, rows = m.list()
+        try:
+            m.logout()
+        except (OSError, imaplib.IMAP4.error):
+            pass
+    except UnicodeEncodeError:
+        raise Fail("the user name and password must be plain ASCII characters")
+    except (OSError, imaplib.IMAP4.error) as e:
+        raise Fail(f"could not connect to {host}:{port} ({security}): {e}")
+    folders = []
+    for r in rows or []:
+        if not isinstance(r, bytes):
+            continue          # a literal: a name this simple parser does not handle
+        m = re.match(r'^\((?P<flags>[^)]*)\) (?P<delim>"(?:[^"\\]|\\.)*"|NIL) (?P<name>.+)$',
+                     r.decode(errors="replace"))
+        if not m:
+            continue
+        name = m.group("name")
+        if name.startswith('"'):
+            name = re.sub(r"\\(.)", r"\1", name[1:-1])
+        delim = m.group("delim")
+        delim = "" if delim == "NIL" else re.sub(r"\\(.)", r"\1", delim[1:-1])
+        folders.append((name, m.group("flags").split(), delim))
+    return folders
+
+
+def import_plan(folders):
+    """What to leave out, and which folders to merge into ours afterwards."""
+    skip = list(IMPORT_SKIP)
+    merges = []
+    for name, flags, delim in folders:
+        local = name.replace(delim, "/") if delim and delim != "/" else name
+        if "\\Important" in flags and "&" not in name:
+            skip.append(local)              # Gmail's "Important" label
+        for flag, ours in IMPORT_MERGE.items():
+            if flag in flags and local != ours:
+                merges.append([local, ours])
+    return skip, merges
+
+
+def import_conf(host, port, security, user, pw):
+    """A Dovecot config for the import: the server's own plus the old server."""
+    main = "/etc/dovecot/dovecot.conf"
+    with open(main) as f:
+        v = re.search(r"^\s*dovecot_config_version\s*=\s*(\S+)", f.read(), re.M)
+    q = lambda s: '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    lines = [f"dovecot_config_version = {v.group(1)}"] if v else []   # 2.4 wants it first
+    lines += [f"!include {main}",
+              f"imapc_host = {q(host)}", f"imapc_port = {port}",
+              f"imapc_user = {q(user)}", f"imapc_password = {q(pw)}",
+              f"imapc_ssl = {'imaps' if security == 'ssl' else 'starttls'}",
+              "ssl_client_ca_dir = /etc/ssl/certs",
+              "ssl_client_require_valid_cert = yes" if v else "imapc_ssl_verify = yes"]
+    return "\n".join(lines) + "\n"
+
+
+def mailbox_messages(email, mailbox=None):
+    p = run(["doveadm", "-f", "tab", "mailbox", "status", "-u", email, "messages", mailbox or "*"],
+            check=False, timeout=300)
+    return sum(int(x) for x in p.stdout.split()[1:] if x.isdigit())
+
+
+def unit_active(unit):
+    if not unit:
+        return False
+    return run(["systemctl", "is-active", unit], check=False).stdout.strip() in ("active", "activating")
+
+
+def import_start(email, host, port=None, security="ssl", user="", allow_private=False):
+    email = lower_email(email)
+    if not find_user(read_users(), email):
+        raise Fail(f"no such mailbox: {email}")
+    host = (host or "").strip().lower().rstrip(".")
+    if not HOST_RE.match(host):
+        raise Fail(f"invalid server name: {host or '<none>'} (e.g. imap.gmail.com)")
+    security = (security or "ssl").lower()
+    if security not in ("ssl", "starttls"):
+        raise Fail("security must be ssl (port 993) or starttls (port 143)")
+    try:
+        port = int(port or (993 if security == "ssl" else 143))
+    except ValueError:
+        raise Fail("port must be a number")
+    if not allow_private and port not in (143, 993):
+        raise Fail("port must be 993 (SSL/TLS) or 143 (STARTTLS)")
+    user = (user or "").strip()
+    # Dovecot would expand %-variables in the user name.
+    if not user or len(user) > 200 or not user.isprintable() or "%" in user:
+        raise Fail("invalid user name for the old server")
+    pw = sys.stdin.readline().rstrip("\n") if not sys.stdin.isatty() else getpass.getpass("Password on the old server: ")
+    if not pw or not pw.isprintable():
+        raise Fail("the password for the old server is empty or contains control characters")
+    if "%{" in pw and dovecot_version() >= (2, 4):
+        # Dovecot 2.4 expands %{...} in imapc_password, and there is no
+        # escaping that works for every password.
+        raise Fail("passwords containing '%{' cannot be imported; change it on the old server for the import")
+    state_file, log_file, conf_file, unit = import_paths(email)
+    st = read_json(state_file, {})
+    if st.get("status") == "running" and unit_active(st.get("unit")):
+        raise Fail(f"an import into {email} is already running")
+    import_check_host(host, allow_private)
+    folders = import_probe(host, port, security, user, pw)
+    skip, merges = import_plan(folders)
+    for d in (IMPORT_DIR, IMPORT_RUN_DIR):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(conf_file + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(import_conf(host, port, security, user, pw))
+    os.replace(conf_file + ".tmp", conf_file)
+    unit = f"{unit}-{int(time.time())}"
+    st = {"email": email, "host": host, "port": port, "security": security, "user": user,
+          "status": "running", "started": datetime.datetime.now().isoformat(timespec="seconds"),
+          "finished": None, "folders": len(folders), "skip": skip, "merges": merges, "unit": unit,
+          "before": mailbox_messages(email), "imported": None, "message": ""}
+    write_json(state_file, st, mode=0o600)
+    with open(log_file, "w"):
+        pass
+    # Low priority, in its own unit: a big mailbox takes hours and must not
+    # stop when the dashboard request that started it ends.
+    p = run(["systemd-run", "--unit", unit, "--collect", "--quiet", "-p", "Nice=10",
+             "-p", "IOSchedulingClass=idle", "/usr/local/sbin/mailctl", "user", "import", "run", email],
+            check=False)
+    if p.returncode != 0:
+        os.remove(conf_file)
+        st.update(status="failed", message=f"could not start: {(p.stderr or p.stdout).strip()[:200]}")
+        write_json(state_file, st, mode=0o600)
+        raise Fail(st["message"])
+    audit(f"import start {email} from {user}@{host}:{port}")
+    info(f"importing mail from {user} at {host} into {email} in the background "
+         f"(mailctl user import status {email})")
+    return import_status(email)
+
+
+def import_merge(email, src, dst):
+    """Move an imported folder's messages (e.g. Gmail's "[Gmail]/Sent Mail")
+    into ours ("Sent"). Messages already there are dropped, so running the
+    import again does not duplicate them."""
+    def rows(mailbox):
+        p = run(["doveadm", "-f", "json", "fetch", "-u", email, "uid hdr.message-id",
+                 "mailbox", mailbox, "all"], check=False, timeout=900)
+        try:
+            return json.loads(p.stdout or "[]") if p.returncode == 0 else None
+        except ValueError:
+            return None
+    src_rows = rows(src)
+    if src_rows is None:
+        return 0
+    run(["doveadm", "mailbox", "create", "-s", "-u", email, dst], check=False)
+    have = {(r.get("hdr.message-id") or "").strip() for r in rows(dst) or []} - {""}
+    move, dup = [], []
+    for r in src_rows:
+        mid = (r.get("hdr.message-id") or "").strip()
+        (dup if mid and mid in have else move).append(str(r["uid"]))
+        have.add(mid)
+    for i in range(0, len(move), 500):
+        run(["doveadm", "move", "-u", email, dst, "mailbox", src, "uid", ",".join(move[i:i + 500])],
+            check=False, timeout=900)
+    for i in range(0, len(dup), 500):
+        run(["doveadm", "expunge", "-u", email, "mailbox", src, "uid", ",".join(dup[i:i + 500])],
+            check=False, timeout=900)
+    return len(move)
+
+
+def mailbox_delete_if_empty(email, mailbox):
+    children = run(["doveadm", "mailbox", "list", "-u", email, f"{mailbox}/*"], check=False).stdout.strip()
+    if not children and mailbox_messages(email, mailbox) == 0:
+        run(["doveadm", "mailbox", "delete", "-u", email, mailbox], check=False)
+
+
+def import_run(email):
+    """The background part of "user import start" (runs in its own unit)."""
+    email = lower_email(email)
+    state_file, log_file, conf_file, _ = import_paths(email)
+    st = read_json(state_file, None)
+    if not st or st.get("status") != "running" or not os.path.exists(conf_file):
+        raise Fail(f"no import is waiting to run for {email}")
+    # One-way sync from the old server: adds what is missing here, never
+    # deletes anything on either side, and can safely run again later.
+    cmd = ["doveadm", "-c", conf_file, "sync", "-1", "-R"]
+    for x in st["skip"]:
+        cmd += ["-x", x]
+    cmd += ["-u", email, "imapc:"]
+    rc = 1
+    try:
+        for _ in range(3):       # exit code 2: changes during the sync, run again
+            with open(log_file, "a") as log:
+                rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL).returncode
+            if rc != 2:
+                break
+    finally:
+        os.remove(conf_file)     # it holds the old server's password
+    for src, dst in st["merges"]:
+        import_merge(email, src, dst)
+        mailbox_delete_if_empty(email, src)
+        if "/" in src:
+            mailbox_delete_if_empty(email, src.rsplit("/", 1)[0])
+    errors = [line for line in import_log(log_file, 200) if "Error:" in line or "Fatal:" in line]
+    st.update(status="done" if rc == 0 else "failed",
+              finished=datetime.datetime.now().isoformat(timespec="seconds"),
+              imported=max(0, mailbox_messages(email) - (st.get("before") or 0)),
+              message=re.sub(r"^.*?(Error|Fatal): ", "", errors[-1])[:300] if errors and rc != 0 else "")
+    write_json(state_file, st, mode=0o600)
+    audit(f"import {st['status']} {email}: {st['imported']} message(s) from {st['host']}")
+    return st
+
+
+def import_log(path, lines=15):
+    try:
+        with open(path, errors="replace") as f:
+            return [x.rstrip("\n") for x in f.readlines()[-lines:]]
+    except OSError:
+        return []
+
+
+def import_status(email):
+    email = lower_email(email)
+    state_file, log_file, conf_file, _ = import_paths(email)
+    st = read_json(state_file, None)
+    if not st:
+        return {"email": email, "status": "none"}
+    if st["status"] == "running" and not unit_active(st.get("unit")):
+        time.sleep(1)            # the unit may be writing its result right now
+        st = read_json(state_file, st)
+        if st["status"] == "running":
+            st.update(status="failed", message="the import stopped unexpectedly (server restart?)",
+                      finished=datetime.datetime.now().isoformat(timespec="seconds"))
+            write_json(state_file, st, mode=0o600)
+            if os.path.exists(conf_file):
+                os.remove(conf_file)
+    st["log"] = [x for x in import_log(log_file) if " Info: " not in x]
+    return st
+
+
+def import_cancel(email):
+    email = lower_email(email)
+    state_file, _, conf_file, _ = import_paths(email)
+    st = read_json(state_file, None)
+    if not st or st.get("status") != "running":
+        raise Fail(f"no import is running for {email}")
+    run(["systemctl", "stop", st["unit"]], check=False, timeout=60)
+    if os.path.exists(conf_file):
+        os.remove(conf_file)
+    st.update(status="cancelled", finished=datetime.datetime.now().isoformat(timespec="seconds"),
+              message="stopped; mail copied so far was kept")
+    write_json(state_file, st, mode=0o600)
+    audit(f"import cancel {email}")
+    info(f"import into {email} stopped")
+    return import_status(email)
 
 
 # ------------------------------------------------------------------ alerts & weekly report
@@ -2164,6 +2676,28 @@ def show_rules(r):
         print("vacation:   off")
 
 
+def show_apppw(r):
+    print(f"{r['email']}: mail apps " + ("must use app passwords" if r["required"]
+                                         else "may use the mailbox password or an app password"))
+    table([(p["id"], p["name"], p["created"][:16].replace("T", " ")) for p in r["passwords"]],
+          ["id", "name", "created"])
+
+
+def show_import(r):
+    if r["status"] == "none":
+        print(f"no import for {r['email']}")
+        return
+    print(f"{r['email']}: {r['status']} - from {r['user']} at {r['host']}:{r['port']}, "
+          f"started {r['started'][:16].replace('T', ' ')}"
+          + (f", finished {r['finished'][:16].replace('T', ' ')}" if r.get("finished") else ""))
+    if r.get("imported") is not None:
+        print(f"messages imported: {r['imported']}")
+    if r.get("message"):
+        print(r["message"])
+    if r["status"] == "running" and r.get("log"):
+        print("\n".join(r["log"][-5:]))
+
+
 def show_checks(rows):
     group = None
     for r in rows:
@@ -2190,6 +2724,26 @@ Mailboxes
   user vacation <email> [--subject S] [--start YYYY-MM-DD] [--end YYYY-MM-DD] | --off
                                   Auto-reply; the message is read from stdin
   user rules <email>              Show forwarding and vacation settings
+
+App passwords (a separate password for each mail app, revocable one by one)
+  user apppass add <email> [--name "Anna's iPhone"]
+                                  Create one; it is printed once
+  user apppass list <email>       List them
+  user apppass del <email> <id>   Delete one; that app can no longer sign in
+  user apppass require <email> yes|no
+                                  yes: mail apps (IMAP, SMTP, calendars) must use
+                                  an app password; webmail and the dashboard keep
+                                  the mailbox password. Changing the mailbox
+                                  password deletes all its app passwords.
+
+Importing mail from another provider
+  user import start <email> --host imap.gmail.com --user old@gmail.com
+                    [--security ssl|starttls] [--port 993]
+                                  Copy all mail and folders (password on stdin).
+                                  Runs in the background; nothing is deleted on
+                                  either side, and running it again only copies
+                                  what is new.
+  user import status <email> | user import cancel <email>
 
 Aliases / forwarding
   alias add <alias> <dest>[,<dest>...]
@@ -2293,8 +2847,10 @@ def main(argv):
 
     # Python file descriptors are not inherited by child processes, so the
     # lock is never held by a service that mailctl happens to (re)start.
+    # Password checks only read, and sign-ins must not wait behind a long job.
     lock = open(LOCK_FILE, "w")
-    fcntl.flock(lock, fcntl.LOCK_EX)
+    if args[:2] != ["user", "checkpw"]:
+        fcntl.flock(lock, fcntl.LOCK_EX)
 
     cmd = args[0]
     sub = args[1] if len(args) > 1 else ""
@@ -2337,6 +2893,46 @@ def main(argv):
             emit(user_vacation(a[0] if a else "", subject, start, end, off), show_rules)
         elif sub == "rules":
             emit(rules_get(arg), show_rules)
+        elif sub == "checkpw":
+            apps = flag("--app")
+            a = args[2:]
+            emit(user_checkpw(a[0] if a else "", apps), lambda r: print("ok" if r["ok"] else "wrong"))
+        elif sub == "apppass":
+            act = a[0] if a else ""
+            name = opt("--name", "")
+            rest = args[3:]
+            email = rest[0] if rest else ""
+            if act == "add":
+                emit(apppw_add(email, name), lambda r: print(
+                    f"App password for {r['email']} ({r['name']}):\n\n    {r['password']}\n\n"
+                    "Use it instead of the mailbox password in that app. It is not shown again."))
+            elif act == "del":
+                emit(apppw_del(email, rest[1] if len(rest) > 1 else ""), show_apppw)
+            elif act == "require":
+                emit(apppw_require(email, rest[1] if len(rest) > 1 else ""), show_apppw)
+            elif act == "list":
+                emit(apppw_list(email), show_apppw)
+            else:
+                print(USAGE)
+                return 1
+        elif sub == "import":
+            act = a[0] if a else ""
+            host, port, security = opt("--host"), opt("--port"), opt("--security", "ssl")
+            iuser, private = opt("--user", ""), flag("--allow-private")
+            rest = args[3:]
+            email = rest[0] if rest else ""
+            if act == "start":
+                emit(import_start(email, host, port, security, iuser, private), show_import)
+            elif act == "run":
+                fcntl.flock(lock, fcntl.LOCK_UN)     # takes hours; let everything else go on
+                emit(import_run(email), show_import)
+            elif act == "cancel":
+                emit(import_cancel(email), show_import)
+            elif act == "status":
+                emit(import_status(email), show_import)
+            else:
+                print(USAGE)
+                return 1
         else:
             print(USAGE)
             return 1

@@ -13,7 +13,7 @@
 #   Radicale  - calendars and contacts (CalDAV/CardDAV) at /dav/
 #   Dashboard - web admin panel at https://MAIL_HOSTNAME/admin/ (with 2FA)
 #   Certbot   - Let's Encrypt certificates, renewed automatically
-#   MTA-STS, TLS-RPT, outbound MTA-STS checks, postscreen, mailbox quotas
+#   MTA-STS, TLS-RPT, outbound MTA-STS and DANE checks, postscreen, quotas
 #   Fail2ban, UFW firewall, unattended security upgrades, nightly backups
 #
 # Usage:
@@ -122,6 +122,7 @@ preflight() {
   ENABLE_DAV=${ENABLE_DAV:-yes}
   ENABLE_MTA_STS=${ENABLE_MTA_STS:-yes}
   MTA_STS_MODE=${MTA_STS_MODE:-enforce}
+  ENABLE_DANE=${ENABLE_DANE:-yes}
   ADMIN_ALLOWED_IPS=${ADMIN_ALLOWED_IPS:-}
   DEFAULT_QUOTA=${DEFAULT_QUOTA:-}
   BACKUP_RSYNC_TARGET=${BACKUP_RSYNC_TARGET:-}
@@ -153,6 +154,7 @@ preflight() {
   [[ $MESSAGE_SIZE_LIMIT_MB =~ ^[0-9]+$ ]] || die "MESSAGE_SIZE_LIMIT_MB must be a number"
   [[ $SSH_PORT =~ ^[0-9]+$ ]] || die "SSH_PORT must be a number"
   [[ $MTA_STS_MODE =~ ^(enforce|testing|none)$ ]] || die "MTA_STS_MODE must be enforce, testing or none"
+  [[ $ENABLE_DANE =~ ^(yes|no)$ ]] || die "ENABLE_DANE must be yes or no"
   [[ -z $DEFAULT_QUOTA || $DEFAULT_QUOTA =~ ^[0-9]+[KMGTkmgt]?$ ]] || die "DEFAULT_QUOTA must look like 5G or 500M"
   [[ $OUTGOING_LIMIT_PER_HOUR =~ ^[0-9]+$ ]] || die "OUTGOING_LIMIT_PER_HOUR must be a number (0 = no limit)"
   [[ -z $DNS_PROVIDER || $DNS_PROVIDER =~ ^(cloudflare|digitalocean)$ ]] || die "DNS_PROVIDER must be cloudflare or digitalocean"
@@ -320,6 +322,52 @@ setup_vmail_user() {
   install -d -o vmail -g vmail -m 750 /var/vmail
 }
 
+setup_resolver() {
+  step "DNS resolver (Unbound)"
+  render "$TEMPLATES/unbound/mail-server.conf" /etc/unbound/unbound.conf.d/mail-server.conf
+  systemctl disable --now unbound-resolvconf.service >/dev/null 2>&1 || true
+  # With DANE on, Unbound answers every DNS query on this machine.
+  install -d /etc/systemd/system/unbound.service.d
+  printf '# Installed by mail-server install.sh\n[Service]\nRestart=always\nRestartSec=2\n' \
+    >/etc/systemd/system/unbound.service.d/mail-server.conf
+  systemctl daemon-reload
+  systemctl enable unbound >/dev/null
+  systemctl restart unbound
+
+  # DANE: Postfix only trusts TLSA records (the receiving server's published
+  # certificate) when the resolver has checked their DNSSEC signatures. The
+  # usual resolver, systemd-resolved, doesn't, so Unbound becomes the system
+  # resolver - but only once it is seen to validate.
+  local resolv=/etc/resolv.conf marker='# Managed by mail-server install.sh' i flags
+  DANE_ACTIVE=no
+  if [[ $ENABLE_DANE == yes ]]; then
+    for ((i = 0; i < 20; i++)); do
+      # "ad" (authenticated data) in the answer's flags: the signature checked out.
+      flags=$(dig @127.0.0.1 +dnssec +time=3 +tries=1 . SOA 2>/dev/null | grep -o '^;; flags:[a-z ]*' || true)
+      if [[ $flags == *" ad"* ]]; then
+        DANE_ACTIVE=yes
+        break
+      fi
+      sleep 1
+    done
+    if [[ $DANE_ACTIVE == yes ]]; then
+      if [[ -L $resolv ]]; then readlink "$resolv" >"$ETC/resolv.conf.link"; fi
+      if ! grep -qs "^$marker" "$resolv"; then
+        rm -f "$resolv"
+        printf '%s\n%s\n%s\nnameserver 127.0.0.1\noptions edns0 trust-ad\n' "$marker" \
+          '# Unbound (local) checks DNSSEC, so Postfix can use DANE for outgoing mail.' \
+          '# ENABLE_DANE="no" in mail-server.conf puts systemd-resolved back.' >"$resolv"
+      fi
+    else
+      warn "Unbound could not validate DNSSEC (is outgoing DNS blocked?). DANE stays off; run install.sh again later."
+    fi
+  fi
+  if [[ $DANE_ACTIVE == no ]] && grep -qs "^$marker" "$resolv"; then
+    rm -f "$resolv"
+    ln -s "$(cat "$ETC/resolv.conf.link" 2>/dev/null || echo ../run/systemd/resolve/stub-resolv.conf)" "$resolv"
+  fi
+}
+
 setup_nginx_http() {
   install -d -m 755 /var/www/letsencrypt /var/www/mail-autoconfig
   rm -f /etc/nginx/sites-enabled/default
@@ -378,6 +426,13 @@ setup_postfix() {
     postmap "hash:/etc/postfix/$f"
   done
 
+  # Outgoing TLS: DANE when the resolver checks DNSSEC (setup_resolver),
+  # otherwise encrypted whenever the other server offers it. A relay
+  # service (mailctl relay) always gets mandatory TLS.
+  local tls_level=may dns_level=enabled
+  if [[ $DANE_ACTIVE == yes ]]; then tls_level=dane; dns_level=dnssec; fi
+  if [[ -n $(postconf -h relayhost 2>/dev/null) ]]; then tls_level=encrypt; fi
+
   postconf -e \
     "myhostname = $MAIL_HOSTNAME" \
     "mydomain = $DOMAIN" \
@@ -404,7 +459,8 @@ setup_postfix() {
     "smtpd_tls_loglevel = 1" \
     "smtpd_tls_received_header = yes" \
     'smtpd_tls_session_cache_database = btree:${data_directory}/smtpd_scache' \
-    "smtp_tls_security_level = may" \
+    "smtp_tls_security_level = $tls_level" \
+    "smtp_dns_support_level = $dns_level" \
     "smtp_tls_loglevel = 1" \
     "smtp_tls_CApath = /etc/ssl/certs" \
     'smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache' \
@@ -502,6 +558,8 @@ setup_dovecot() {
   [[ -f /etc/dovecot/users ]] || install -m 640 -o root -g dovecot /dev/null /etc/dovecot/users
   chown root:dovecot /etc/dovecot/users
   chmod 640 /etc/dovecot/users
+  # App passwords, one file each (written by "mailctl user apppass").
+  install -d -m 750 -o root -g dovecot /etc/dovecot/app-passwords
 
   install -d -m 755 /etc/dovecot/sieve
   install -m 644 "$TEMPLATES"/sieve/*.sieve /etc/dovecot/sieve/
@@ -514,13 +572,7 @@ setup_dovecot() {
 }
 
 setup_rspamd() {
-  step "Rspamd (spam filter + DKIM), Redis, Unbound, ClamAV"
-
-  render "$TEMPLATES/unbound/mail-server.conf" /etc/unbound/unbound.conf.d/mail-server.conf
-  # Keep /etc/resolv.conf as it is; Unbound is only for Rspamd.
-  systemctl disable --now unbound-resolvconf.service >/dev/null 2>&1 || true
-  systemctl enable unbound >/dev/null
-  systemctl restart unbound
+  step "Rspamd (spam filter + DKIM), Redis, ClamAV"
 
   systemctl enable --now redis-server >/dev/null
 
@@ -706,6 +758,7 @@ setup_tools() {
   step "Management tools and backups"
   install -m 755 "$SCRIPT_DIR/bin/mailctl" /usr/local/sbin/mailctl
   install -m 755 "$SCRIPT_DIR/bin/mail-backup" /usr/local/sbin/mail-backup
+  install -m 755 "$SCRIPT_DIR/bin/mail-mcp" /usr/local/sbin/mail-mcp
 
   cat >/etc/cron.d/mail-server <<'EOF'
 # Installed by mail-server install.sh
@@ -874,6 +927,7 @@ main() {
   setup_system
   install_packages
   setup_vmail_user
+  setup_resolver
   setup_certificates
   setup_postfix
   setup_dovecot

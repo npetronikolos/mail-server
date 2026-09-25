@@ -33,6 +33,7 @@
         <td><strong>{{ u.email }}</strong>
           {% if u.admin %}<span class="badge">admin</span>{% endif %}
           {% if u.totp %}<span class="badge ok" title="Two-factor sign-in for the dashboard">2FA</span>{% endif %}
+          {% if u.app_only %}<span class="badge ok" title="Mail apps must use app passwords">app passwords only</span>{% elif u.app_passwords %}<span class="badge" title="App passwords">{{ u.app_passwords }} app password{{ 's' if u.app_passwords != 1 }}</span>{% endif %}
           {% if u.shared_with %}<br><small class="muted">shared with {{ u.shared_with|join(', ') }}</small>{% endif %}
         </td>
         <td class="usage">
@@ -53,7 +54,14 @@
                 <label>New password<input name="password" type="password" minlength="10" autocomplete="new-password" data-pw></label>
                 <label class="check"><input type="checkbox" name="generate" value="1" data-gen> Generate one</label>
                 <button class="btn small">Set password</button>
+                {% if u.app_passwords %}<small class="muted">This also deletes its app passwords.</small>{% endif %}
               </form>
+              {% if u.app_only %}
+              <form method="post" action="{{ url_for('mailbox_app_passwords', email=u.email) }}">
+                <input type="hidden" name="csrf" value="{{ csrf }}">
+                <button class="btn small">Allow the mailbox password in mail apps</button>
+              </form>
+              {% endif %}
               <form method="post" action="{{ url_for('mailbox_quota', email=u.email) }}" class="row">
                 <input type="hidden" name="csrf" value="{{ csrf }}">
                 <input name="quota" value="{{ u.quota }}" placeholder="unlimited" size="8" aria-label="Storage limit">
